@@ -174,23 +174,33 @@ class Moderation(commands.Cog):
 
     # -- bans / kicks ------------------------------------------------------
 
-    @app_commands.command(name="ban", description="Ban a member (optionally delete recent messages).")
-    @app_commands.describe(member="Member to ban", reason="Reason", delete_hours="Hours of messages to delete (0–168)")
-    @app_commands.default_permissions(ban_members=True)
-    async def ban(self, interaction: discord.Interaction, member: discord.Member, reason: str | None = None, delete_hours: app_commands.Range[int, 0, 168] = 0):
-        err = self.check_hierarchy(interaction.user, member)
-        if err:
-            return await interaction.response.send_message(f"⛔ {err}", ephemeral=True)
-        await self.try_dm(member, f"You have been banned from **{interaction.guild.name}**.\nReason: {reason or 'not specified'}")
-        await member.ban(reason=f"{interaction.user}: {reason or 'no reason'}", delete_message_seconds=delete_hours * 3600)
-        await interaction.response.send_message(f"🔨 {member.mention} banned.")
-        await self.send_log(mod_embed("🔨 Member Banned",
-                                      f"{member.mention} banned by {interaction.user.mention}.\n**Reason:** {reason or '—'}",
-                                      RED, member.id))
+    @property
+    def ban_log(self) -> discord.TextChannel | None:
+        return (
+            self.bot.get_channel(self.bot.channel_id("BAN_LOG_CHANNEL_ID"))
+            or self.mod_log
+        )
 
-    @app_commands.command(name="unban", description="Unban a user by ID or name#tag.")
+    @commands.hybrid_command(name="ban", description="Ban a member.")
+    @app_commands.describe(member="Member to ban", reason="Reason")
     @app_commands.default_permissions(ban_members=True)
-    async def unban(self, interaction: discord.Interaction, user: str, reason: str | None = None):
+    @commands.has_permissions(ban_members=True)
+    async def ban(self, ctx: commands.Context, member: discord.Member, *, reason: str | None = None):
+        err = self.check_hierarchy(ctx.author, member)
+        if err:
+            return await ctx.reply(f"⛔ {err}", ephemeral=True)
+        await self.try_dm(member, f"You have been banned from **{ctx.guild.name}**.\nReason: {reason or 'not specified'}")
+        await member.ban(reason=f"{ctx.author}: {reason or 'no reason'}")
+        await ctx.reply(f"🔨 {member.mention} banned.")
+        await self.send_log(mod_embed("🔨 Member Banned",
+                                      f"{member.mention} banned by {ctx.author.mention}.\n**Reason:** {reason or '—'}",
+                                      RED, member.id), self.ban_log)
+
+    @commands.hybrid_command(name="unban", description="Unban a user by ID or name.")
+    @app_commands.describe(user="User ID or username", reason="Reason")
+    @app_commands.default_permissions(ban_members=True)
+    @commands.has_permissions(ban_members=True)
+    async def unban(self, ctx: commands.Context, user: str, *, reason: str | None = None):
         target = None
         if user.isdigit():
             try:
@@ -198,100 +208,116 @@ class Moderation(commands.Cog):
             except discord.NotFound:
                 pass
         if target is None:
-            async for entry in interaction.guild.bans(limit=None):
+            async for entry in ctx.guild.bans(limit=None):
                 if str(entry.user) == user or entry.user.name == user:
                     target = entry.user
                     break
         if target is None:
-            return await interaction.response.send_message("❌ User not found in ban list.", ephemeral=True)
-        await interaction.guild.unban(target, reason=f"{interaction.user}: {reason or 'no reason'}")
-        await interaction.response.send_message(f"🕊️ {target.mention} unbanned.")
+            return await ctx.reply("❌ User not found in ban list.", ephemeral=True)
+        await ctx.guild.unban(target, reason=f"{ctx.author}: {reason or 'no reason'}")
+        await ctx.reply(f"🕊️ {target.mention} unbanned.")
         await self.send_log(mod_embed("🕊️ Member Unbanned",
-                                      f"{target.mention} unbanned by {interaction.user.mention}.\n**Reason:** {reason or '—'}",
-                                      GREEN, target.id))
+                                      f"{target.mention} unbanned by {ctx.author.mention}.\n**Reason:** {reason or '—'}",
+                                      GREEN, target.id), self.ban_log)
 
-    @app_commands.command(name="kick", description="Kick a member from the server.")
+    @commands.hybrid_command(name="kick", description="Kick a member from the server.")
+    @app_commands.describe(member="Member to kick", reason="Reason")
     @app_commands.default_permissions(kick_members=True)
-    async def kick(self, interaction: discord.Interaction, member: discord.Member, reason: str | None = None):
-        err = self.check_hierarchy(interaction.user, member)
+    @commands.has_permissions(kick_members=True)
+    async def kick(self, ctx: commands.Context, member: discord.Member, *, reason: str | None = None):
+        err = self.check_hierarchy(ctx.author, member)
         if err:
-            return await interaction.response.send_message(f"⛔ {err}", ephemeral=True)
-        await self.try_dm(member, f"You have been kicked from **{interaction.guild.name}**.\nReason: {reason or 'not specified'}")
-        await member.kick(reason=f"{interaction.user}: {reason or 'no reason'}")
-        await interaction.response.send_message(f"👢 {member.mention} kicked.")
+            return await ctx.reply(f"⛔ {err}", ephemeral=True)
+        await self.try_dm(member, f"You have been kicked from **{ctx.guild.name}**.\nReason: {reason or 'not specified'}")
+        await member.kick(reason=f"{ctx.author}: {reason or 'no reason'}")
+        await ctx.reply(f"👢 {member.mention} kicked.")
         await self.send_log(mod_embed("👢 Member Kicked",
-                                      f"{member.mention} kicked by {interaction.user.mention}.\n**Reason:** {reason or '—'}",
-                                      ORANGE, member.id))
+                                      f"{member.mention} kicked by {ctx.author.mention}.\n**Reason:** {reason or '—'}",
+                                      ORANGE, member.id), self.ban_log)
 
     # -- timeouts ----------------------------------------------------------
 
-    @app_commands.command(name="timeout", description="Time a member out (max 28 days).")
+    @commands.hybrid_command(name="timeout", description="Time a member out (minutes, max 28 days).")
     @app_commands.describe(member="Member", minutes="Duration in minutes (max 40320)", reason="Reason")
     @app_commands.default_permissions(moderate_members=True)
-    async def timeout(self, interaction: discord.Interaction, member: discord.Member, minutes: app_commands.Range[int, 1, 40320], reason: str | None = None):
-        err = self.check_hierarchy(interaction.user, member)
+    @commands.has_permissions(moderate_members=True)
+    async def timeout(self, ctx: commands.Context, member: discord.Member, minutes: commands.Range[int, 1, 40320], *, reason: str | None = None):
+        err = self.check_hierarchy(ctx.author, member)
         if err:
-            return await interaction.response.send_message(f"⛔ {err}", ephemeral=True)
+            return await ctx.reply(f"⛔ {err}", ephemeral=True)
         until = now() + timedelta(minutes=minutes)
-        await member.timeout(until, reason=f"{interaction.user}: {reason or 'no reason'}")
-        await interaction.response.send_message(f"⏳ {member.mention} timed out for {minutes} min.")
-        await self.try_dm(member, f"You have been timed out in **{interaction.guild.name}** for {minutes} minutes.\nReason: {reason or 'not specified'}")
+        await member.timeout(until, reason=f"{ctx.author}: {reason or 'no reason'}")
+        await ctx.reply(f"⏳ {member.mention} timed out for {minutes} min.")
+        await self.try_dm(member, f"You have been timed out in **{ctx.guild.name}** for {minutes} minutes.\nReason: {reason or 'not specified'}")
         await self.send_log(mod_embed("⏳ Member Timed Out",
-                                      f"{member.mention} timed out by {interaction.user.mention} until <t:{int(until.timestamp())}:f>.\n**Reason:** {reason or '—'}",
+                                      f"{member.mention} timed out by {ctx.author.mention} until <t:{int(until.timestamp())}:f>.\n**Reason:** {reason or '—'}",
                                       ORANGE, member.id))
 
-    @app_commands.command(name="untimeout", description="Remove a member's timeout.")
+    @commands.hybrid_command(name="untimeout", description="Remove a member's timeout.")
     @app_commands.default_permissions(moderate_members=True)
-    async def untimeout(self, interaction: discord.Interaction, member: discord.Member, reason: str | None = None):
-        await member.timeout(None, reason=f"{interaction.user}: {reason or 'no reason'}")
-        await interaction.response.send_message(f"✅ Timeout removed for {member.mention}.")
+    @commands.has_permissions(moderate_members=True)
+    async def untimeout(self, ctx: commands.Context, member: discord.Member, *, reason: str | None = None):
+        await member.timeout(None, reason=f"{ctx.author}: {reason or 'no reason'}")
+        await ctx.reply(f"✅ Timeout removed for {member.mention}.")
         await self.send_log(mod_embed("✅ Timeout Removed",
-                                      f"{member.mention}'s timeout removed by {interaction.user.mention}.",
+                                      f"{member.mention}'s timeout removed by {ctx.author.mention}.",
                                       GREEN, member.id))
 
     # -- warnings ----------------------------------------------------------
 
-    @app_commands.command(name="warn", description="Warn a member (recorded permanently).")
+    @commands.hybrid_command(name="warn", description="Warn a member (recorded permanently).")
+    @app_commands.describe(member="Member to warn", reason="Reason")
     @app_commands.default_permissions(moderate_members=True)
-    async def warn(self, interaction: discord.Interaction, member: discord.Member, reason: str):
-        warning_id = await self.bot.db.add_warning(interaction.guild_id, member.id, interaction.user.id, reason)
-        count = len(await self.bot.db.warnings_for(interaction.guild_id, member.id))
-        await interaction.response.send_message(f"⚠️ {member.mention} warned (warning #{count}).")
-        await self.try_dm(member, f"You have been warned in **{interaction.guild.name}**.\nReason: {reason}\nTotal warnings: {count}")
+    @commands.has_permissions(moderate_members=True)
+    async def warn(self, ctx: commands.Context, member: discord.Member, *, reason: str):
+        warning_id = await self.bot.db.add_warning(ctx.guild.id, member.id, ctx.author.id, reason)
+        count = len(await self.bot.db.warnings_for(ctx.guild.id, member.id))
+        await ctx.reply(f"⚠️ {member.mention} warned (warning #{count}).")
+        await self.try_dm(member, f"You have been warned in **{ctx.guild.name}**.\nReason: {reason}\nTotal warnings: {count}")
         await self.send_log(mod_embed("⚠️ Member Warned",
-                                      f"{member.mention} warned by {interaction.user.mention} (#{warning_id}, total {count}).\n**Reason:** {reason}",
+                                      f"{member.mention} warned by {ctx.author.mention} (#{warning_id}, total {count}).\n**Reason:** {reason}",
                                       ORANGE, member.id))
 
-    @app_commands.command(name="warnings", description="List a member's warnings.")
+    @commands.hybrid_command(name="warnings", description="List a member's warnings.")
     @app_commands.default_permissions(moderate_members=True)
-    async def warnings(self, interaction: discord.Interaction, member: discord.Member):
-        rows = await self.bot.db.warnings_for(interaction.guild_id, member.id)
+    @commands.has_permissions(moderate_members=True)
+    async def warnings(self, ctx: commands.Context, member: discord.Member):
+        rows = await self.bot.db.warnings_for(ctx.guild.id, member.id)
         if not rows:
-            return await interaction.response.send_message(f"{member.mention} has no warnings. 🎉", ephemeral=True)
+            return await ctx.reply(f"{member.mention} has no warnings. 🎉", ephemeral=True)
         lines = [f"• **#{wid}** {created[:10]} by <@{mod_id}> — {reason or 'no reason'}" for wid, mod_id, reason, created in rows[-20:]]
         embed = mod_embed(f"Warnings — {member.display_name} ({len(rows)})", "\n".join(lines), BLUE, member.id)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await ctx.reply(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="clearwarnings", description="Clear all warnings for a member.")
+    @commands.hybrid_command(name="clearwarnings", description="Clear all warnings for a member.")
     @app_commands.default_permissions(administrator=True)
-    async def clearwarnings(self, interaction: discord.Interaction, member: discord.Member):
-        n = await self.bot.db.clear_warnings(interaction.guild_id, member.id)
-        await interaction.response.send_message(f"🧹 Cleared {n} warning(s) for {member.mention}.")
+    @commands.has_permissions(administrator=True)
+    async def clearwarnings(self, ctx: commands.Context, member: discord.Member):
+        n = await self.bot.db.clear_warnings(ctx.guild.id, member.id)
+        await ctx.reply(f"🧹 Cleared {n} warning(s) for {member.mention}.")
         await self.send_log(mod_embed("🧹 Warnings Cleared",
-                                      f"{n} warning(s) for {member.mention} cleared by {interaction.user.mention}.",
+                                      f"{n} warning(s) for {member.mention} cleared by {ctx.author.mention}.",
                                       BLUE, member.id))
 
     # -- channel tools -----------------------------------------------------
 
-    @app_commands.command(name="purge", description="Delete the last N messages in this channel (max 100).")
+    @commands.hybrid_command(name="purge", description="Delete the last N messages in this channel (max 100).")
+    @app_commands.describe(amount="How many messages", member="Only delete this member's messages")
     @app_commands.default_permissions(manage_messages=True)
-    async def purge(self, interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100], member: discord.Member | None = None):
-        await interaction.response.defer(ephemeral=True)
+    @commands.has_permissions(manage_messages=True)
+    async def purge(self, ctx: commands.Context, amount: commands.Range[int, 1, 100], member: discord.Member | None = None):
+        await ctx.defer(ephemeral=True)
+        if ctx.interaction is None:
+            # prefix invocation: delete the ".purge" message itself too
+            try:
+                await ctx.message.delete()
+            except discord.HTTPException:
+                pass
         check = (lambda m: m.author.id == member.id) if member else (lambda m: True)
-        deleted = await interaction.channel.purge(limit=amount, check=check, reason=f"Purge by {interaction.user}")
-        await interaction.followup.send(f"🧹 Deleted {len(deleted)} message(s).", ephemeral=True)
+        deleted = await ctx.channel.purge(limit=amount, check=check, reason=f"Purge by {ctx.author}")
+        await ctx.send(f"🧹 Deleted {len(deleted)} message(s).", ephemeral=True, delete_after=5)
         await self.send_log(mod_embed("🧹 Messages Purged",
-                                      f"{len(deleted)} message(s) purged in {interaction.channel.mention} by {interaction.user.mention}"
+                                      f"{len(deleted)} message(s) purged in {ctx.channel.mention} by {ctx.author.mention}"
                                       + (f" (from {member.mention})" if member else "") + ".",
                                       BLUE))
 
