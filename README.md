@@ -1,152 +1,88 @@
-# 🎙️ Discord Voice Management Bot
+# 🎙️ P&P Sentinel — Discord Voice Manager
 
-> 🚧 ⚠️ **Disclaimer**  
-> This project is **not currently under active development**.  
-> While the features and setup instructions are provided, there may be bugs or outdated information.  
-> Contributions and feedback are still welcome, but users should be aware that support may be limited.
+A voice-management and moderation bot built for the **Politics & Philosophy** Discord server, self-hosted on macOS. Modernized to discord.py 2.x with slash commands.
 
-A flexible Discord bot to help server moderators manage **voice channels**, **roles**, and **moderation logs**. Ideal for handling "detain" scenarios and tracking mute/unmute actions seamlessly.
-
----
+Originally a small companion bot for VoiceMaster-style temp voice channels (auto-clearing stale server mutes); now a full moderation sidekick with persistent records.
 
 ## ✨ Features
 
-### 🔊 Automatic Voice Channel Management
-- Automatically unmutes users upon joining or switching voice channels.
-- Logs unmute events to a dedicated channel.
-- Notifies users via DM.
+### 🔊 Voice management
+- **Auto-unmute** — users who join/switch voice channels while carrying a stale server mute are unmuted automatically, logged, and DM'd.
+- **Sticky mutes** — `/stickymute` keeps a user muted across rejoins (exempt from auto-unmute); `/unstickymute` releases them.
+- Manual mute/unmute actions are logged to the voice log with the acting moderator (from the audit log).
 
-### 🛡️ Detain Role Management
-- Use `.detain` to assign a restricted role to users.
-- Use `.undetain` to remove the restricted role.
-- Sends DM notifications and logs both actions.
+### ⛓️ Detainment
+- `/detain` + `.detain` — assign the Detained role, disconnect from voice, DM the user, log the action, and record it in SQLite.
+- `/undetain` + `.undetain` — release, with the same trail.
+- `/detainhistory` — full per-user detention history.
+- Manual role add/removals are detected and logged too.
 
-### 📜 Moderation Logging
-- Logs manual mute/unmute actions and moderator info.
-- Sends DMs to the affected users.
-- All logs are timestamped and posted to configured channels.
+### 🛡️ Moderation
+`/ban` (with message-deletion window) · `/unban` · `/kick` · `/timeout` · `/untimeout` · `/warn` · `/warnings` · `/clearwarnings` · `/purge` · `/slowmode` · `/lock` · `/unlock`
 
-### 🧠 Smart Configuration
-- Uses `.env` and `config.json` for clean, secure setup.
-- Easily adaptable to any Discord server.
+All actions: hierarchy-checked, reason-logged to the mod log, DM'd to the target when possible, and persisted (warnings/detentions) in `sentinel.db`.
 
----
+### ℹ️ Info
+`/userinfo` · `/serverinfo` · `/credits` (also `.credits`)
 
-## 🛠️ Setup Instructions
+## 🛠️ Setup
 
-### ✅ Requirements
-- Python 3.8+
-- A Discord Bot Token from https://discord.com/developers/applications
-- Admin access to your Discord server
-
-### 🧩 Installation Steps
+Requirements: Python 3.10+, a bot token with **Server Members** and **Message Content** privileged intents enabled.
 
 ```bash
-git clone https://github.com/arturpedrotti/discord-voice-manager.git
+git clone https://github.com/arturgrochau/discord-voice-manager.git
 cd discord-voice-manager
-pip install -r requirements.txt
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+cp config_template.json config.json   # fill in your IDs
+echo 'DISCORD_BOT_TOKEN=your-token' > .env
 ```
 
-### 🔐 Bot Configuration
+`config.json`:
 
-#### 1. `.env`
-Create a `.env` file to store your secret token:
+| Key | Meaning |
+|---|---|
+| `GUILD_ID` | Your server ID (slash commands sync here instantly) |
+| `DETAIN_ROLE_ID` | Role assigned by `/detain` |
+| `MOD_LOG_CHANNEL_ID` | Channel for moderation action embeds |
+| `DETAIN_LOG_CHANNEL_ID` | Channel for detain/release embeds (falls back to mod log) |
+| `VOICE_LOG_CHANNEL_ID` | Channel for voice mute/unmute embeds |
+| `AUTO_UNMUTE` | `true`/`false` — enable the auto-unmute behavior |
+
+Run directly:
 
 ```bash
-touch .env
+.venv/bin/python bot.py
 ```
 
-Paste this line into `.env`:
-
-```env
-DISCORD_BOT_TOKEN=your-discord-token-here
-```
-
-#### 2. `config.json`
-Create a `config.json` using the template below:
-
-```json
-{
-  "MUTE_LOG_CHANNEL_ID": 123456789012345678,
-  "DETAIN_ROLE_ID": 123456789012345678,
-  "DETAIN_LOG_CHANNEL_ID": 123456789012345678,
-  "VOICEMASTER_BOT_ID": 123456789012345678
-}
-```
-
-> Replace all `123456789012345678` with real Discord channel or role IDs from your server.
-
-You can optionally create `config_template.json` and `.env.example` in the repo to help others.
-
----
-
-## 🚀 Running the Bot
+## 🚀 Run 24/7 on macOS (launchd)
 
 ```bash
-python discord_voice_manager.py
+./scripts/install.sh
 ```
 
-The bot will log in and respond to voice and role events.
-
----
-
-## 📋 Commands
-
-| Command             | Description                                                               |
-|---------------------|---------------------------------------------------------------------------|
-| `.detain @user`     | Assigns the detain role and notifies/logs the action                      |
-| `.undetain @user`   | Removes the detain role and notifies/logs the action                      |
-| `.credits`          | Displays bot creator and license information                              |
-
----
-
-## 🧪 Example Scenario
-
-### 🛡️ Detaining a User
-1. Moderator types `.detain @JohnDoe`
-2. The bot adds the "Detained" role
-3. Logs the event to the Detain Log channel
-4. Sends a DM to the user notifying them
-
-### 🔊 Auto Unmute
-1. A user joins a voice channel muted
-2. The bot unmutes them and logs it
-3. The user receives a DM with the update
-
----
-
-## 🧩 File Structure
+Installs a LaunchAgent (`com.arturgrochau.pnp-sentinel`) that starts the bot at login, keeps it alive, restarts it on crash/network recovery, and writes rotating logs to `logs/`.
 
 ```bash
-discord-voice-manager/
-│
-├── discord_voice_manager.py    # Main bot logic
-├── config.json                 # Your server-specific IDs
-├── .env                        # Your secret bot token
-├── requirements.txt            # Python dependencies
-├── LICENSE                     # MIT License
-└── README.md                   # You are here
+tail -f logs/sentinel.log                                  # watch
+launchctl kickstart -k gui/$(id -u)/com.arturgrochau.pnp-sentinel   # restart
+launchctl bootout gui/$(id -u)/com.arturgrochau.pnp-sentinel        # stop
 ```
 
----
+## 🧩 Architecture
 
-## 🙌 Credits
+```
+bot.py               # entrypoint: intents, config, cog loading, slash sync
+db.py                # aiosqlite persistence (warnings, detentions, sticky mutes)
+cogs/voice.py        # auto-unmute + voice logging + sticky mutes
+cogs/moderation.py   # detain + full moderation suite
+cogs/info.py         # credits/userinfo/serverinfo
+launchd/…plist       # macOS service definition
+scripts/install.sh   # one-shot service install
+```
 
-Built and maintained by **Artur Pedrotti**  
-[GitHub](https://github.com/arturpedrotti)
-
----
+The bot pairs with a self-hosted [NadekoBot](https://nadekobot.readthedocs.io/) instance that handles spam/raid protection, filters, and general utility — Sentinel keeps the `.` prefix surface minimal (`.detain`, `.undetain`, `.credits`) to avoid colliding with it.
 
 ## 📜 License
 
-This project is licensed under the [MIT License](LICENSE).
-
----
-
-## 🧠 Tips for Contributors
-
-- Fork and clone the repo
-- Add your changes in a new branch
-- Keep commits atomic and clean
-- Use `.env.example` and `config_template.json` to help others
-- Submit a PR 🚀
+MIT — built by [Artur Grochau](https://github.com/arturgrochau).

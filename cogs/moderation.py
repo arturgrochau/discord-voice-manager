@@ -1,0 +1,334 @@
+"""Moderation: detain/undetain, bans, kicks, timeouts, purge, warnings, channel locks."""
+
+import logging
+from datetime import datetime, timedelta, timezone
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+log = logging.getLogger("sentinel.moderation")
+
+GREEN = 0x2ECC71
+RED = 0xE74C3C
+ORANGE = 0xE67E22
+BLUE = 0x3498DB
+
+
+def now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def mod_embed(title: str, description: str, color: int, user_id: int | None = None) -> discord.Embed:
+    embed = discord.Embed(title=title, description=description, color=color, timestamp=now())
+    if user_id:
+        embed.set_footer(text=f"User ID: {user_id}")
+    return embed
+
+
+class Moderation(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+    # -- helpers -----------------------------------------------------------
+
+    @property
+    def mod_log(self) -> discord.TextChannel | None:
+        return self.bot.get_channel(self.bot.channel_id("MOD_LOG_CHANNEL_ID"))
+
+    @property
+    def detain_log(self) -> discord.TextChannel | None:
+        return (
+            self.bot.get_channel(self.bot.channel_id("DETAIN_LOG_CHANNEL_ID"))
+            or self.mod_log
+        )
+
+    def detain_role(self, guild: discord.Guild) -> discord.Role | None:
+        return guild.get_role(self.bot.channel_id("DETAIN_ROLE_ID"))
+
+    async def send_log(self, embed: discord.Embed, channel: discord.TextChannel | None = None) -> None:
+        channel = channel or self.mod_log
+        if channel:
+            try:
+                await channel.send(embed=embed)
+            except discord.HTTPException:
+                log.warning("Failed to send mod log embed")
+
+    @staticmethod
+    async def try_dm(user: discord.abc.User, message: str) -> None:
+        try:
+            await user.send(message)
+        except discord.HTTPException:
+            pass
+
+    @staticmethod
+    def check_hierarchy(actor: discord.Member, target: discord.Member) -> str | None:
+        if target == actor:
+            return "You can't moderate yourself."
+        if target.guild.owner_id == target.id:
+            return "You can't moderate the server owner."
+        if actor.guild.owner_id != actor.id and target.top_role >= actor.top_role:
+            return "You can't moderate someone with an equal or higher role."
+        me = target.guild.me
+        if target.top_role >= me.top_role:
+            return "My role is too low to moderate that member — move my role higher."
+        return None
+
+    # -- detain ------------------------------------------------------------
+
+    @commands.hybrid_command(name="detain", description="Detain a member: restrict them to the detainment channels.")
+    @app_commands.describe(member="Member to detain", reason="Why they are being detained")
+    @app_commands.default_permissions(manage_roles=True)
+    @commands.has_permissions(manage_roles=True)
+    async def detain(self, ctx: commands.Context, member: discord.Member, *, reason: str | None = None):
+        role = self.detain_role(ctx.guild)
+        if not role:
+            return await ctx.reply("⚠️ Detain role not configured — set DETAIN_ROLE_ID in config.json.")
+        err = self.check_hierarchy(ctx.author, member)
+        if err:
+            return await ctx.reply(f"⛔ {err}")
+        if role in member.roles:
+            return await ctx.reply(f"ℹ️ {member.mention} is already detained.")
+        await member.add_roles(role, reason=f"Detained by {ctx.author}: {reason or 'no reason'}")
+        if member.voice:
+            try:
+                await member.move_to(None, reason="Detained — disconnected from voice")
+            except discord.HTTPException:
+                pass
+        await self.bot.db.open_detention(ctx.guild.id, member.id, ctx.author.id, reason)
+        await ctx.reply(f"⛓️ {member.mention} has been detained.")
+        await self.try_dm(member, f"You have been detained in **{ctx.guild.name}**.\nReason: {reason or 'not specified'}")
+        await self.send_log(
+            mod_embed("⛓️ User Detained",
+                      f"{member.mention} detained by {ctx.author.mention}.\n**Reason:** {reason or '—'}",
+                      RED, member.id),
+            self.detain_log,
+        )
+
+    @commands.hybrid_command(name="undetain", description="Release a detained member.")
+    @app_commands.describe(member="Member to release", reason="Why they are being released")
+    @app_commands.default_permissions(manage_roles=True)
+    @commands.has_permissions(manage_roles=True)
+    async def undetain(self, ctx: commands.Context, member: discord.Member, *, reason: str | None = None):
+        role = self.detain_role(ctx.guild)
+        if not role:
+            return await ctx.reply("⚠️ Detain role not configured — set DETAIN_ROLE_ID in config.json.")
+        if role not in member.roles:
+            return await ctx.reply(f"ℹ️ {member.mention} is not detained.")
+        await member.remove_roles(role, reason=f"Undetained by {ctx.author}: {reason or 'no reason'}")
+        await self.bot.db.close_detention(ctx.guild.id, member.id)
+        await ctx.reply(f"🕊️ {member.mention} has been released.")
+        await self.try_dm(member, f"You have been released from detainment in **{ctx.guild.name}**.")
+        await self.send_log(
+            mod_embed("🕊️ User Released",
+                      f"{member.mention} released by {ctx.author.mention}.\n**Reason:** {reason or '—'}",
+                      GREEN, member.id),
+            self.detain_log,
+        )
+
+    @commands.Cog.listener()
+    async def on_member_update(self, before: discord.Member, after: discord.Member):
+        """Log detain role changes made manually (outside bot commands)."""
+        role = self.detain_role(after.guild)
+        if not role:
+            return
+        had, has = role in before.roles, role in after.roles
+        if had == has:
+            return
+        if has:
+            await self.bot.db.open_detention(after.guild.id, after.id, None, "role added manually")
+            await self.try_dm(after, f"You have been detained in **{after.guild.name}**.")
+            await self.send_log(
+                mod_embed("⛓️ User Detained", f"{after.mention} was detained (role added).", RED, after.id),
+                self.detain_log,
+            )
+        else:
+            await self.bot.db.close_detention(after.guild.id, after.id)
+            await self.try_dm(after, f"You have been released from detainment in **{after.guild.name}**.")
+            await self.send_log(
+                mod_embed("🕊️ User Released", f"{after.mention} was released (role removed).", GREEN, after.id),
+                self.detain_log,
+            )
+
+    @app_commands.command(name="detainhistory", description="Show a member's detention history.")
+    @app_commands.default_permissions(manage_roles=True)
+    async def detainhistory(self, interaction: discord.Interaction, member: discord.Member):
+        rows = await self.bot.db.detention_history(interaction.guild_id, member.id)
+        if not rows:
+            return await interaction.response.send_message(f"{member.mention} has no detention history.", ephemeral=True)
+        lines = []
+        for mod_id, reason, detained_at, released_at in rows[-15:]:
+            mod = f"<@{mod_id}>" if mod_id else "manual"
+            status = f"released {released_at[:10]}" if released_at else "**active**"
+            lines.append(f"• {detained_at[:10]} by {mod} — {reason or 'no reason'} ({status})")
+        embed = mod_embed(f"Detention history — {member.display_name}", "\n".join(lines), BLUE, member.id)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # -- bans / kicks ------------------------------------------------------
+
+    @app_commands.command(name="ban", description="Ban a member (optionally delete recent messages).")
+    @app_commands.describe(member="Member to ban", reason="Reason", delete_hours="Hours of messages to delete (0–168)")
+    @app_commands.default_permissions(ban_members=True)
+    async def ban(self, interaction: discord.Interaction, member: discord.Member, reason: str | None = None, delete_hours: app_commands.Range[int, 0, 168] = 0):
+        err = self.check_hierarchy(interaction.user, member)
+        if err:
+            return await interaction.response.send_message(f"⛔ {err}", ephemeral=True)
+        await self.try_dm(member, f"You have been banned from **{interaction.guild.name}**.\nReason: {reason or 'not specified'}")
+        await member.ban(reason=f"{interaction.user}: {reason or 'no reason'}", delete_message_seconds=delete_hours * 3600)
+        await interaction.response.send_message(f"🔨 {member.mention} banned.")
+        await self.send_log(mod_embed("🔨 Member Banned",
+                                      f"{member.mention} banned by {interaction.user.mention}.\n**Reason:** {reason or '—'}",
+                                      RED, member.id))
+
+    @app_commands.command(name="unban", description="Unban a user by ID or name#tag.")
+    @app_commands.default_permissions(ban_members=True)
+    async def unban(self, interaction: discord.Interaction, user: str, reason: str | None = None):
+        target = None
+        if user.isdigit():
+            try:
+                target = await self.bot.fetch_user(int(user))
+            except discord.NotFound:
+                pass
+        if target is None:
+            async for entry in interaction.guild.bans(limit=None):
+                if str(entry.user) == user or entry.user.name == user:
+                    target = entry.user
+                    break
+        if target is None:
+            return await interaction.response.send_message("❌ User not found in ban list.", ephemeral=True)
+        await interaction.guild.unban(target, reason=f"{interaction.user}: {reason or 'no reason'}")
+        await interaction.response.send_message(f"🕊️ {target.mention} unbanned.")
+        await self.send_log(mod_embed("🕊️ Member Unbanned",
+                                      f"{target.mention} unbanned by {interaction.user.mention}.\n**Reason:** {reason or '—'}",
+                                      GREEN, target.id))
+
+    @app_commands.command(name="kick", description="Kick a member from the server.")
+    @app_commands.default_permissions(kick_members=True)
+    async def kick(self, interaction: discord.Interaction, member: discord.Member, reason: str | None = None):
+        err = self.check_hierarchy(interaction.user, member)
+        if err:
+            return await interaction.response.send_message(f"⛔ {err}", ephemeral=True)
+        await self.try_dm(member, f"You have been kicked from **{interaction.guild.name}**.\nReason: {reason or 'not specified'}")
+        await member.kick(reason=f"{interaction.user}: {reason or 'no reason'}")
+        await interaction.response.send_message(f"👢 {member.mention} kicked.")
+        await self.send_log(mod_embed("👢 Member Kicked",
+                                      f"{member.mention} kicked by {interaction.user.mention}.\n**Reason:** {reason or '—'}",
+                                      ORANGE, member.id))
+
+    # -- timeouts ----------------------------------------------------------
+
+    @app_commands.command(name="timeout", description="Time a member out (max 28 days).")
+    @app_commands.describe(member="Member", minutes="Duration in minutes (max 40320)", reason="Reason")
+    @app_commands.default_permissions(moderate_members=True)
+    async def timeout(self, interaction: discord.Interaction, member: discord.Member, minutes: app_commands.Range[int, 1, 40320], reason: str | None = None):
+        err = self.check_hierarchy(interaction.user, member)
+        if err:
+            return await interaction.response.send_message(f"⛔ {err}", ephemeral=True)
+        until = now() + timedelta(minutes=minutes)
+        await member.timeout(until, reason=f"{interaction.user}: {reason or 'no reason'}")
+        await interaction.response.send_message(f"⏳ {member.mention} timed out for {minutes} min.")
+        await self.try_dm(member, f"You have been timed out in **{interaction.guild.name}** for {minutes} minutes.\nReason: {reason or 'not specified'}")
+        await self.send_log(mod_embed("⏳ Member Timed Out",
+                                      f"{member.mention} timed out by {interaction.user.mention} until <t:{int(until.timestamp())}:f>.\n**Reason:** {reason or '—'}",
+                                      ORANGE, member.id))
+
+    @app_commands.command(name="untimeout", description="Remove a member's timeout.")
+    @app_commands.default_permissions(moderate_members=True)
+    async def untimeout(self, interaction: discord.Interaction, member: discord.Member, reason: str | None = None):
+        await member.timeout(None, reason=f"{interaction.user}: {reason or 'no reason'}")
+        await interaction.response.send_message(f"✅ Timeout removed for {member.mention}.")
+        await self.send_log(mod_embed("✅ Timeout Removed",
+                                      f"{member.mention}'s timeout removed by {interaction.user.mention}.",
+                                      GREEN, member.id))
+
+    # -- warnings ----------------------------------------------------------
+
+    @app_commands.command(name="warn", description="Warn a member (recorded permanently).")
+    @app_commands.default_permissions(moderate_members=True)
+    async def warn(self, interaction: discord.Interaction, member: discord.Member, reason: str):
+        warning_id = await self.bot.db.add_warning(interaction.guild_id, member.id, interaction.user.id, reason)
+        count = len(await self.bot.db.warnings_for(interaction.guild_id, member.id))
+        await interaction.response.send_message(f"⚠️ {member.mention} warned (warning #{count}).")
+        await self.try_dm(member, f"You have been warned in **{interaction.guild.name}**.\nReason: {reason}\nTotal warnings: {count}")
+        await self.send_log(mod_embed("⚠️ Member Warned",
+                                      f"{member.mention} warned by {interaction.user.mention} (#{warning_id}, total {count}).\n**Reason:** {reason}",
+                                      ORANGE, member.id))
+
+    @app_commands.command(name="warnings", description="List a member's warnings.")
+    @app_commands.default_permissions(moderate_members=True)
+    async def warnings(self, interaction: discord.Interaction, member: discord.Member):
+        rows = await self.bot.db.warnings_for(interaction.guild_id, member.id)
+        if not rows:
+            return await interaction.response.send_message(f"{member.mention} has no warnings. 🎉", ephemeral=True)
+        lines = [f"• **#{wid}** {created[:10]} by <@{mod_id}> — {reason or 'no reason'}" for wid, mod_id, reason, created in rows[-20:]]
+        embed = mod_embed(f"Warnings — {member.display_name} ({len(rows)})", "\n".join(lines), BLUE, member.id)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="clearwarnings", description="Clear all warnings for a member.")
+    @app_commands.default_permissions(administrator=True)
+    async def clearwarnings(self, interaction: discord.Interaction, member: discord.Member):
+        n = await self.bot.db.clear_warnings(interaction.guild_id, member.id)
+        await interaction.response.send_message(f"🧹 Cleared {n} warning(s) for {member.mention}.")
+        await self.send_log(mod_embed("🧹 Warnings Cleared",
+                                      f"{n} warning(s) for {member.mention} cleared by {interaction.user.mention}.",
+                                      BLUE, member.id))
+
+    # -- channel tools -----------------------------------------------------
+
+    @app_commands.command(name="purge", description="Delete the last N messages in this channel (max 100).")
+    @app_commands.default_permissions(manage_messages=True)
+    async def purge(self, interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100], member: discord.Member | None = None):
+        await interaction.response.defer(ephemeral=True)
+        check = (lambda m: m.author.id == member.id) if member else (lambda m: True)
+        deleted = await interaction.channel.purge(limit=amount, check=check, reason=f"Purge by {interaction.user}")
+        await interaction.followup.send(f"🧹 Deleted {len(deleted)} message(s).", ephemeral=True)
+        await self.send_log(mod_embed("🧹 Messages Purged",
+                                      f"{len(deleted)} message(s) purged in {interaction.channel.mention} by {interaction.user.mention}"
+                                      + (f" (from {member.mention})" if member else "") + ".",
+                                      BLUE))
+
+    @app_commands.command(name="slowmode", description="Set slowmode delay for this channel (seconds; 0 to disable).")
+    @app_commands.default_permissions(manage_channels=True)
+    async def slowmode(self, interaction: discord.Interaction, seconds: app_commands.Range[int, 0, 21600]):
+        await interaction.channel.edit(slowmode_delay=seconds, reason=f"Slowmode by {interaction.user}")
+        msg = f"🐌 Slowmode set to {seconds}s." if seconds else "🚀 Slowmode disabled."
+        await interaction.response.send_message(msg)
+
+    @app_commands.command(name="lock", description="Lock this channel (deny @everyone Send Messages).")
+    @app_commands.default_permissions(manage_channels=True)
+    async def lock(self, interaction: discord.Interaction, reason: str | None = None):
+        overwrite = interaction.channel.overwrites_for(interaction.guild.default_role)
+        overwrite.send_messages = False
+        await interaction.channel.set_permissions(interaction.guild.default_role, overwrite=overwrite, reason=f"Lock by {interaction.user}: {reason or 'no reason'}")
+        await interaction.response.send_message("🔒 Channel locked.")
+        await self.send_log(mod_embed("🔒 Channel Locked",
+                                      f"{interaction.channel.mention} locked by {interaction.user.mention}.\n**Reason:** {reason or '—'}",
+                                      RED))
+
+    @app_commands.command(name="unlock", description="Unlock this channel.")
+    @app_commands.default_permissions(manage_channels=True)
+    async def unlock(self, interaction: discord.Interaction):
+        overwrite = interaction.channel.overwrites_for(interaction.guild.default_role)
+        overwrite.send_messages = None
+        await interaction.channel.set_permissions(interaction.guild.default_role, overwrite=overwrite, reason=f"Unlock by {interaction.user}")
+        await interaction.response.send_message("🔓 Channel unlocked.")
+        await self.send_log(mod_embed("🔓 Channel Unlocked",
+                                      f"{interaction.channel.mention} unlocked by {interaction.user.mention}.",
+                                      GREEN))
+
+    # -- error handling ----------------------------------------------------
+
+    async def cog_command_error(self, ctx: commands.Context, error: Exception):
+        if isinstance(error, commands.MissingPermissions):
+            await ctx.reply("⛔ You don't have permission to do that.")
+        elif isinstance(error, commands.MemberNotFound):
+            await ctx.reply("❌ Member not found.")
+        elif isinstance(error, commands.MissingRequiredArgument):
+            await ctx.reply(f"Usage: `.{ctx.command.name} @user [reason]`")
+        else:
+            log.exception("Command error in %s", ctx.command, exc_info=error)
+            await ctx.reply("💥 Something went wrong — check the logs.")
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(Moderation(bot))
