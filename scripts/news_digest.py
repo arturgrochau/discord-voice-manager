@@ -21,6 +21,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -199,17 +200,26 @@ def gather(max_attempts: int = 3) -> dict:
 
 
 def validate_stories(data: dict) -> dict:
-    """Keep only stories whose tweet or article URL verifiably exists."""
+    """Keep only stories whose tweet or article URL verifiably exists.
+
+    Also dedupes across sections — grok sometimes files one story under two.
+    """
     out: dict = {}
+    seen: set[str] = set()
     for section in CHANNELS:
         kept = []
         for s in (data.get(section) or [])[:5]:
             x_url = (s.get("x_url") or "").strip()
             article = (s.get("article_url") or "").strip()
+            if x_url in seen or (article and article in seen):
+                log.info("Deduped cross-section story: %s", s.get("title"))
+                continue
             if X_URL_RE.match(x_url) and tweet_ok(x_url):
                 kept.append({"content": x_url})
+                seen.update({x_url, article} - {""})
             elif article.startswith("http") and url_alive(article):
                 kept.append({"content": f"**{s.get('title', '').strip()}**\n{article}"})
+                seen.update({x_url, article} - {""})
             else:
                 log.warning("Dropped unvalidated story: %s (x=%s, article=%s)",
                             s.get("title"), x_url or "-", article or "-")
@@ -219,15 +229,21 @@ def validate_stories(data: dict) -> dict:
 
 X_URL_RE = re.compile(r"^https://(?:x|twitter)\.com/([A-Za-z0-9_]+)/status/\d+", re.I)
 
-# Only these accounts may appear as bare tweet posts (quality/notability bar).
-ACCOUNT_ALLOWLIST = {
+# English-only major outlets: notability given, no language check needed
+# (their tweets are often just "headline + link", too short for heuristics).
+ENGLISH_SAFE_ACCOUNTS = {
     "elonmusk", "reuters", "afp", "skynews", "bbcworld", "bbcbreaking",
     "ft", "financialtimes", "bloomberg", "business", "wsj", "politicoeurope",
-    "politico", "euronews", "dwnews", "dw_politics", "visegrad24",
-    "marionawfal", "radiogenoa", "disclosetv", "spectatorindex", "bricsinfo",
-    "globeeyenews", "afpost", "endwokeness", "europeinvasionn", "idf",
-    "eucouncil", "eu_commission", "zelenskyyua", "emmanuelmacron",
+    "politico", "euronews", "dwnews", "dw_politics", "spectatorindex",
+    "eucouncil", "eu_commission",
 }
+# Commentary/aggregator accounts: allowed, but tweet text must read as English.
+MIXED_ACCOUNTS = {
+    "visegrad24", "marionawfal", "radiogenoa", "disclosetv", "bricsinfo",
+    "globeeyenews", "afpost", "endwokeness", "europeinvasionn", "idf",
+    "zelenskyyua", "emmanuelmacron",
+}
+ACCOUNT_ALLOWLIST = ENGLISH_SAFE_ACCOUNTS | MIXED_ACCOUNTS
 
 ENGLISH_HINTS = re.compile(
     r"\b(the|of|and|to|in|is|for|on|with|has|have|will|was|were|are|that|this|from|by|be|it)\b",
@@ -255,6 +271,8 @@ def tweet_ok(url: str) -> bool:
             data = json.loads(r.read())
     except Exception:
         return False
+    if m.group(1).lower() in ENGLISH_SAFE_ACCOUNTS:
+        return True
     text = re.sub(r"<[^>]+>", " ", data.get("html", ""))
     hits = len(ENGLISH_HINTS.findall(text))
     if hits < 2:
@@ -264,10 +282,14 @@ def tweet_ok(url: str) -> bool:
 
 
 def url_alive(url: str) -> bool:
+    """Anti-hallucination check: fabricated article URLs 404; bot-blocked
+    real articles (Reuters/Bloomberg 401/403) still count as alive."""
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=15) as r:
             return r.status < 400
+    except urllib.error.HTTPError as e:
+        return e.code in (401, 403, 429)
     except Exception:
         return False
 
