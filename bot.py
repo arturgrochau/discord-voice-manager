@@ -72,6 +72,7 @@ class Sentinel(commands.Bot):
 
         self.db = Database(BASE_DIR / "sentinel.db")
         await self.db.setup()
+        self.tree.on_error = self.on_app_command_error
 
         for ext in ("cogs.voice", "cogs.moderation", "cogs.info"):
             await self.load_extension(ext)
@@ -86,6 +87,25 @@ class Sentinel(commands.Bot):
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s (%s)", self.user, self.user.id)
+
+    async def on_app_command_error(self, interaction, error) -> None:
+        from discord import app_commands
+
+        if isinstance(error, app_commands.MissingPermissions):
+            msg = "⛔ You don't have permission to do that."
+        elif isinstance(error, app_commands.CommandInvokeError):
+            log.exception("App command %s failed", interaction.command, exc_info=error.original)
+            msg = f"💥 That didn't work: {error.original}"
+        else:
+            log.exception("App command %s failed", interaction.command, exc_info=error)
+            msg = f"💥 That didn't work: {error}"
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            pass
 
     def channel_id(self, key: str) -> int:
         try:

@@ -29,6 +29,9 @@ def mod_embed(title: str, description: str, color: int, user_id: int | None = No
 class Moderation(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        # user ids whose next detain-role change was made by a bot command,
+        # so on_member_update shouldn't log it a second time
+        self._suppress_role_log: set[int] = set()
 
     # -- helpers -----------------------------------------------------------
 
@@ -89,6 +92,7 @@ class Moderation(commands.Cog):
             return await ctx.reply(f"⛔ {err}")
         if role in member.roles:
             return await ctx.reply(f"ℹ️ {member.mention} is already detained.")
+        self._suppress_role_log.add(member.id)
         await member.add_roles(role, reason=f"Detained by {ctx.author}: {reason or 'no reason'}")
         if member.voice:
             try:
@@ -115,6 +119,7 @@ class Moderation(commands.Cog):
             return await ctx.reply("⚠️ Detain role not configured — set DETAIN_ROLE_ID in config.json.")
         if role not in member.roles:
             return await ctx.reply(f"ℹ️ {member.mention} is not detained.")
+        self._suppress_role_log.add(member.id)
         await member.remove_roles(role, reason=f"Undetained by {ctx.author}: {reason or 'no reason'}")
         await self.bot.db.close_detention(ctx.guild.id, member.id)
         await ctx.reply(f"🕊️ {member.mention} has been released.")
@@ -134,6 +139,9 @@ class Moderation(commands.Cog):
             return
         had, has = role in before.roles, role in after.roles
         if had == has:
+            return
+        if after.id in self._suppress_role_log:
+            self._suppress_role_log.discard(after.id)
             return
         if has:
             await self.bot.db.open_detention(after.guild.id, after.id, None, "role added manually")
