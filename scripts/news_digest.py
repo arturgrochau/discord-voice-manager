@@ -77,7 +77,16 @@ most significant stories of the last 24 hours. Then write a markdown list of:
 For each story: a short factual headline, then every URL you actually saw in
 your search results for it — X status URLs (x.com/<account>/status/<id>) and
 article URLs. Copy URLs character-for-character from search results; NEVER
-write a URL you did not see in a result. If no X post turned up, say so."""
+write a URL you did not see in a result. If no X post turned up, say so.
+
+X post quality bar (strict): ENGLISH-language posts only, from major
+high-follower news/commentary accounts such as: elonmusk, Reuters, AFP,
+SkyNews, BBCWorld, BBCBreaking, FT, Bloomberg, WSJ, POLITICOEurope,
+euronews, DWNews, visegrad24, MarioNawfal, RadioGenoa, disclosetv,
+spectatorindex, BRICSinfo, GlobeEyeNews, AFpost, EndWokeness. Never use
+small unknown accounts or non-English posts. @elonmusk is a priority
+source — check his recent posts (site:x.com/elonmusk) and include any that
+are relevant to today's stories."""
 
 STRUCTURE_PROMPT = """Convert the following researched news list into JSON.
 Sections: world_events (3 stories), europe_news (4), econ_tech (3).
@@ -197,7 +206,7 @@ def validate_stories(data: dict) -> dict:
         for s in (data.get(section) or [])[:5]:
             x_url = (s.get("x_url") or "").strip()
             article = (s.get("article_url") or "").strip()
-            if X_URL_RE.match(x_url) and tweet_exists(x_url):
+            if X_URL_RE.match(x_url) and tweet_ok(x_url):
                 kept.append({"content": x_url})
             elif article.startswith("http") and url_alive(article):
                 kept.append({"content": f"**{s.get('title', '').strip()}**\n{article}"})
@@ -208,21 +217,50 @@ def validate_stories(data: dict) -> dict:
     return out
 
 
-X_URL_RE = re.compile(r"^https://(x|twitter)\.com/[A-Za-z0-9_]+/status/\d+", re.I)
+X_URL_RE = re.compile(r"^https://(?:x|twitter)\.com/([A-Za-z0-9_]+)/status/\d+", re.I)
+
+# Only these accounts may appear as bare tweet posts (quality/notability bar).
+ACCOUNT_ALLOWLIST = {
+    "elonmusk", "reuters", "afp", "skynews", "bbcworld", "bbcbreaking",
+    "ft", "financialtimes", "bloomberg", "business", "wsj", "politicoeurope",
+    "politico", "euronews", "dwnews", "dw_politics", "visegrad24",
+    "marionawfal", "radiogenoa", "disclosetv", "spectatorindex", "bricsinfo",
+    "globeeyenews", "afpost", "endwokeness", "europeinvasionn", "idf",
+    "eucouncil", "eu_commission", "zelenskyyua", "emmanuelmacron",
+}
+
+ENGLISH_HINTS = re.compile(
+    r"\b(the|of|and|to|in|is|for|on|with|has|have|will|was|were|are|that|this|from|by|be|it)\b",
+    re.I,
+)
 
 
-def tweet_exists(url: str) -> bool:
-    """Validate a tweet via X's public oEmbed endpoint (404 for fabricated IDs)."""
+def tweet_ok(url: str) -> bool:
+    """A tweet may be posted bare only if it exists, its author is on the
+    allowlist, and its text reads as English (oEmbed-backed checks)."""
+    m = X_URL_RE.match(url)
+    if not m or m.group(1).lower() not in ACCOUNT_ALLOWLIST:
+        if m:
+            log.info("Rejecting tweet from non-allowlisted account @%s", m.group(1))
+        return False
     try:
-        q = urllib.parse.urlencode({"url": url})
+        q = urllib.parse.urlencode({"url": url, "omit_script": "true"})
         req = urllib.request.Request(
             f"https://publish.twitter.com/oembed?{q}",
             headers={"User-Agent": "Mozilla/5.0 (news-digest validator)"},
         )
         with urllib.request.urlopen(req, timeout=15) as r:
-            return r.status == 200
+            if r.status != 200:
+                return False
+            data = json.loads(r.read())
     except Exception:
         return False
+    text = re.sub(r"<[^>]+>", " ", data.get("html", ""))
+    hits = len(ENGLISH_HINTS.findall(text))
+    if hits < 2:
+        log.info("Rejecting non-English/low-text tweet %s (en-hits=%d)", url, hits)
+        return False
+    return True
 
 
 def url_alive(url: str) -> bool:
