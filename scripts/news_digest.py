@@ -57,36 +57,36 @@ SCHEMA = json.dumps({
     },
 })
 
-PROMPT = """Use live web and X (twitter) search to compile today's news digest
-({date}) for a European politics discussion server. The audience cares most
-about European sovereignty, EU and national politics, migration and border
-policy, security and defence, energy independence, and Europe's economic and
-technological standing.
+RESEARCH_PROMPT = """You are compiling today's ({date}) news digest for a
+European politics discussion server. The audience cares most about European
+sovereignty, EU and national politics, migration and border policy, security
+and defence, energy independence, and Europe's economic and technological
+standing.
 
-Find the most significant stories of the last 24 hours and sort them into
-exactly three sections:
+Run MANY live web searches now — do not answer from memory. Search current
+news sites AND X posts (queries like `site:x.com <story keywords>`) for the
+most significant stories of the last 24 hours. Then write a markdown list of:
 
-- world_events: 3 stories. Global geopolitics, conflicts, diplomacy —
-  prioritising what affects Europe's position in the world.
-- europe_news: 4 stories. EU institutions and national politics, elections,
-  migration and border policy, security, major social debates within Europe.
-- econ_tech: 3 stories. European economy, energy, industry, markets, tech
-  regulation, AI — plus global econ/tech with European impact.
+- 3 WORLD EVENTS stories (global geopolitics/conflicts/diplomacy, prioritising
+  what affects Europe's position in the world)
+- 4 EUROPE NEWS stories (EU institutions and national politics, elections,
+  migration and border policy, security, major social debates in Europe)
+- 3 ECON & TECH stories (European economy, energy, industry, markets, tech
+  regulation, AI; global econ/tech with European impact)
 
-For each story provide:
-- title: a short factual headline.
-- x_url: the URL of a real, existing X post (x.com/<account>/status/<id>)
-  covering this story from a large news or commentary account (e.g.
-  visegrad24, Reuters, SkyNews, MarioNawfal, RadioGenoa, DW, Politico).
-  To find it, run additional web searches like: site:x.com <story keywords>.
-  Copy the status URL character-for-character from an actual search result.
-  Every x_url will be machine-validated against X's oEmbed API — a fabricated
-  or misremembered status ID is worse than none, so when your search results
-  do not contain a directly usable status URL, set x_url to "".
-- article_url: direct URL of a news article covering the story, copied
-  verbatim from your search results.
+For each story: a short factual headline, then every URL you actually saw in
+your search results for it — X status URLs (x.com/<account>/status/<id>) and
+article URLs. Copy URLs character-for-character from search results; NEVER
+write a URL you did not see in a result. If no X post turned up, say so."""
 
-Only include stories you actually found via search. Prefer today's reporting."""
+STRUCTURE_PROMPT = """Convert the following researched news list into JSON.
+Sections: world_events (3 stories), europe_news (4), econ_tech (3).
+For each story: title; x_url = an X status URL present in the text verbatim
+(or "" if that story has none); article_url = an article URL present in the
+text verbatim (or "" if none). Copy URLs exactly — do not invent or repair
+them.
+
+{research}"""
 
 log = logging.getLogger("news-digest")
 
@@ -141,23 +141,71 @@ def parse_grok_output(raw: str) -> dict:
     raise ValueError("No parseable digest JSON in grok output")
 
 
-def gather(max_attempts: int = 3) -> dict:
-    prompt = PROMPT.format(date=datetime.now().strftime("%A, %d %B %Y"))
-    for attempt in range(1, max_attempts + 1):
-        log.info("Grok attempt %d/%d", attempt, max_attempts)
+def extract_text_field(raw: str) -> str:
+    """Pull the assistant's text out of the grok CLI wrapper JSON; fall back to raw."""
+    decoder = json.JSONDecoder()
+    idx = 0
+    while True:
+        start = raw.find("{", idx)
+        if start == -1:
+            break
         try:
-            proc = subprocess.run(
-                [str(GROK), "-p", prompt, "--json-schema", SCHEMA, "--always-approve"],
-                capture_output=True, text=True, timeout=600, cwd=str(Path.home()),
+            obj, end = decoder.raw_decode(raw, start)
+            if isinstance(obj, dict) and isinstance(obj.get("text"), str) and obj["text"].strip():
+                return obj["text"]
+            idx = end
+        except json.JSONDecodeError:
+            idx = start + 1
+    return raw
+
+
+def run_grok(prompt: str, schema: str | None = None) -> str:
+    cmd = [str(GROK), "-p", prompt, "--always-approve"]
+    if schema:
+        cmd += ["--json-schema", schema]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600, cwd=str(Path.home()))
+    return proc.stdout
+
+
+def gather(max_attempts: int = 3) -> dict:
+    """Research (agentic search) then structure, retrying until validation passes."""
+    for attempt in range(1, max_attempts + 1):
+        log.info("Digest attempt %d/%d: research phase", attempt, max_attempts)
+        try:
+            research_raw = run_grok(
+                RESEARCH_PROMPT.format(date=datetime.now().strftime("%A, %d %B %Y"))
             )
-            data = parse_grok_output(proc.stdout)
-            if all(data.get(k) for k in CHANNELS):
-                return data
-            log.warning("Incomplete sections: %s", {k: len(data.get(k, [])) for k in CHANNELS})
+            research = extract_text_field(research_raw)
+            log.info("Research phase returned %d chars; structuring", len(research))
+            data = parse_grok_output(run_grok(STRUCTURE_PROMPT.format(research=research), SCHEMA))
+            validated = validate_stories(data)
+            if all(validated.get(k) for k in CHANNELS):
+                return validated
+            log.warning("Validation left empty sections: %s",
+                        {k: len(validated.get(k, [])) for k in CHANNELS})
         except Exception as e:
             log.warning("Attempt %d failed: %s", attempt, e)
         time.sleep(30)
     raise RuntimeError("Grok digest failed after retries")
+
+
+def validate_stories(data: dict) -> dict:
+    """Keep only stories whose tweet or article URL verifiably exists."""
+    out: dict = {}
+    for section in CHANNELS:
+        kept = []
+        for s in (data.get(section) or [])[:5]:
+            x_url = (s.get("x_url") or "").strip()
+            article = (s.get("article_url") or "").strip()
+            if X_URL_RE.match(x_url) and tweet_exists(x_url):
+                kept.append({"content": x_url})
+            elif article.startswith("http") and url_alive(article):
+                kept.append({"content": f"**{s.get('title', '').strip()}**\n{article}"})
+            else:
+                log.warning("Dropped unvalidated story: %s (x=%s, article=%s)",
+                            s.get("title"), x_url or "-", article or "-")
+        out[section] = kept
+    return out
 
 
 X_URL_RE = re.compile(r"^https://(x|twitter)\.com/[A-Za-z0-9_]+/status/\d+", re.I)
@@ -202,20 +250,9 @@ def send(channel_id: str, content: str, token: str) -> None:
 
 def post_section(section: str, stories: list[dict], token: str) -> int:
     posted = 0
-    for s in stories[:5]:
-        x_url = (s.get("x_url") or "").strip()
-        article = (s.get("article_url") or "").strip()
-        if X_URL_RE.match(x_url) and tweet_exists(x_url):
-            # historical Politics Bot format: bare X link -> rich tweet card
-            content = x_url
-        elif article.startswith("http") and url_alive(article):
-            content = f"**{s['title'].strip()}**\n{article}"
-        else:
-            log.warning("Skipping story, nothing validated: %s (x=%s, article=%s)",
-                        s.get("title"), x_url or "-", article or "-")
-            continue
+    for s in stories:
         try:
-            send(CHANNELS[section], content, token)
+            send(CHANNELS[section], s["content"], token)
             posted += 1
             time.sleep(1.5)
         except Exception:
