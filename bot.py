@@ -88,6 +88,12 @@ class Sentinel(commands.Bot):
     async def on_ready(self) -> None:
         log.info("Logged in as %s (%s)", self.user, self.user.id)
 
+    async def on_command_error(self, ctx, error) -> None:
+        # Nadeko shares the "." prefix, so unknown commands are routine noise.
+        if isinstance(error, commands.CommandNotFound):
+            return
+        await super().on_command_error(ctx, error)
+
     async def on_app_command_error(self, interaction, error) -> None:
         from discord import app_commands
 
