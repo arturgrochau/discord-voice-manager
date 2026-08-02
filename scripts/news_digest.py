@@ -1,8 +1,10 @@
 """Daily news digest for the Politics & Philosophy happenings channels.
 
-Uses the local Grok CLI (headless, live web search) to gather the day's most
-relevant stories through a Europe-first editorial lens, then posts one embed
-per section via the P&P Sentinel bot token:
+Uses the local Grok CLI (headless, live web/X search) to gather the day's most
+relevant stories through a Europe-first editorial lens, then posts them **as
+Politics Bot** in the channel's historical format: one X/Twitter link per
+message so Discord renders rich tweet cards (falling back to a bold headline +
+article link when no good X post exists).
 
     🌎〡world-events   — global geopolitics that matters to Europe
     🛡〡europe-news    — EU/national politics, sovereignty, migration, security
@@ -15,25 +17,23 @@ Scheduled by:  ~/Library/LaunchAgents/com.arturgrochau.pnp-news.plist (daily)
 import json
 import logging
 import logging.handlers
+import re
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 GROK = Path.home() / ".grok/bin/grok"
+NADEKO_CREDS = Path.home() / "Projects/nadekobot/nadeko-osx-arm64/data/creds.yml"
 
 CHANNELS = {
     "world_events": "1285580352236163092",
     "europe_news": "1285580524945145857",
     "econ_tech": "1285579927852417034",
-}
-SECTION_META = {
-    "world_events": ("🌎 World Events — Daily Digest", 0x3498DB),
-    "europe_news": ("🛡️ Europe News — Daily Digest", 0x2C3E50),
-    "econ_tech": ("🚀 Econ & Tech — Daily Digest", 0xE67E22),
 }
 
 SCHEMA = json.dumps({
@@ -49,36 +49,44 @@ SCHEMA = json.dumps({
             "type": "object",
             "properties": {
                 "title": {"type": "string"},
-                "summary": {"type": "string"},
-                "source": {"type": "string"},
-                "url": {"type": "string"},
+                "x_url": {"type": "string"},
+                "article_url": {"type": "string"},
             },
-            "required": ["title", "summary", "source", "url"],
+            "required": ["title", "x_url", "article_url"],
         }
     },
 })
 
-PROMPT = """Use live web search to compile today's news digest ({date}) for a
-European politics discussion server. The audience cares most about European
-sovereignty, EU and national politics, migration and border policy, security
-and defence, energy independence, and Europe's economic and technological
-standing in the world.
+PROMPT = """Use live web and X (twitter) search to compile today's news digest
+({date}) for a European politics discussion server. The audience cares most
+about European sovereignty, EU and national politics, migration and border
+policy, security and defence, energy independence, and Europe's economic and
+technological standing.
 
-Find the most significant stories from the last 24 hours (search several
-reputable outlets — e.g. Politico Europe, Reuters, FT, Euractiv, national
-European press) and sort them into exactly three sections:
+Find the most significant stories of the last 24 hours and sort them into
+exactly three sections:
 
-- world_events: 3 stories. Global geopolitics, conflicts, and diplomacy,
+- world_events: 3 stories. Global geopolitics, conflicts, diplomacy —
   prioritising what affects Europe's position in the world.
 - europe_news: 4 stories. EU institutions and national politics, elections,
-  migration and border policy, security, social debates within Europe.
+  migration and border policy, security, major social debates within Europe.
 - econ_tech: 3 stories. European economy, energy, industry, markets, tech
-  regulation, AI — plus major global econ/tech news with European impact.
+  regulation, AI — plus global econ/tech with European impact.
 
-For each story give a punchy factual title, a 2-3 sentence neutral summary of
-what happened and why it matters to Europe, the source outlet name, and the
-direct article URL. Do not editorialise, do not invent stories, use only
-articles you actually found in search. Prefer today's reporting."""
+For each story provide:
+- title: a short factual headline.
+- x_url: the URL of a real, existing X post (x.com/<account>/status/<id>)
+  covering this story from a large news or commentary account (e.g.
+  visegrad24, Reuters, SkyNews, MarioNawfal, RadioGenoa, DW, Politico).
+  To find it, run additional web searches like: site:x.com <story keywords>.
+  Copy the status URL character-for-character from an actual search result.
+  Every x_url will be machine-validated against X's oEmbed API — a fabricated
+  or misremembered status ID is worse than none, so when your search results
+  do not contain a directly usable status URL, set x_url to "".
+- article_url: direct URL of a news article covering the story, copied
+  verbatim from your search results.
+
+Only include stories you actually found via search. Prefer today's reporting."""
 
 log = logging.getLogger("news-digest")
 
@@ -98,6 +106,41 @@ def setup_logging() -> None:
     logging.getLogger().addHandler(stream)
 
 
+def politics_bot_token() -> str:
+    creds = NADEKO_CREDS.read_text()
+    return re.search(r"^token:\s*'?([A-Za-z0-9_.\-]+)'?", creds, re.M).group(1)
+
+
+def parse_grok_output(raw: str) -> dict:
+    """Grok CLI may print several JSON objects; find the one holding the answer.
+
+    The schema-constrained answer is wrapped as {"text": "<json string>", ...}.
+    Scan every top-level JSON object in the output and unwrap the first usable one.
+    """
+    decoder = json.JSONDecoder()
+    idx, candidates = 0, []
+    while True:
+        start = raw.find("{", idx)
+        if start == -1:
+            break
+        try:
+            obj, end = decoder.raw_decode(raw, start)
+            candidates.append(obj)
+            idx = end
+        except json.JSONDecodeError:
+            idx = start + 1
+    for obj in candidates:
+        if isinstance(obj, dict) and isinstance(obj.get("text"), str):
+            try:
+                inner, _ = decoder.raw_decode(obj["text"].strip())
+                return inner
+            except json.JSONDecodeError:
+                continue
+        if isinstance(obj, dict) and any(k in obj for k in CHANNELS):
+            return obj
+    raise ValueError("No parseable digest JSON in grok output")
+
+
 def gather(max_attempts: int = 3) -> dict:
     prompt = PROMPT.format(date=datetime.now().strftime("%A, %d %B %Y"))
     for attempt in range(1, max_attempts + 1):
@@ -107,12 +150,7 @@ def gather(max_attempts: int = 3) -> dict:
                 [str(GROK), "-p", prompt, "--json-schema", SCHEMA, "--always-approve"],
                 capture_output=True, text=True, timeout=600, cwd=str(Path.home()),
             )
-            raw = proc.stdout.strip()
-            start, end = raw.find("{"), raw.rfind("}")
-            data = json.loads(raw[start:end + 1])
-            if "text" in data and isinstance(data["text"], str):
-                # grok CLI wraps the schema-constrained answer in {"text": "..."}
-                data = json.loads(data["text"])
+            data = parse_grok_output(proc.stdout)
             if all(data.get(k) for k in CHANNELS):
                 return data
             log.warning("Incomplete sections: %s", {k: len(data.get(k, [])) for k in CHANNELS})
@@ -122,28 +160,36 @@ def gather(max_attempts: int = 3) -> dict:
     raise RuntimeError("Grok digest failed after retries")
 
 
-def post(section: str, stories: list[dict], token: str) -> None:
-    title, color = SECTION_META[section]
-    fields = []
-    for s in stories[:5]:
-        summary = s["summary"].strip()
-        if len(summary) > 900:
-            summary = summary[:897] + "..."
-        fields.append({
-            "name": s["title"][:256],
-            "value": f"{summary}\n[{s['source']}]({s['url']})"[:1024],
-            "inline": False,
-        })
-    embed = {
-        "title": title,
-        "color": color,
-        "fields": fields,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "footer": {"text": "Daily digest • Grok live search"},
-    }
+X_URL_RE = re.compile(r"^https://(x|twitter)\.com/[A-Za-z0-9_]+/status/\d+", re.I)
+
+
+def tweet_exists(url: str) -> bool:
+    """Validate a tweet via X's public oEmbed endpoint (404 for fabricated IDs)."""
+    try:
+        q = urllib.parse.urlencode({"url": url})
+        req = urllib.request.Request(
+            f"https://publish.twitter.com/oembed?{q}",
+            headers={"User-Agent": "Mozilla/5.0 (news-digest validator)"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def url_alive(url: str) -> bool:
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.status < 400
+    except Exception:
+        return False
+
+
+def send(channel_id: str, content: str, token: str) -> None:
     req = urllib.request.Request(
-        f"https://discord.com/api/v10/channels/{CHANNELS[section]}/messages",
-        data=json.dumps({"embeds": [embed]}).encode(),
+        f"https://discord.com/api/v10/channels/{channel_id}/messages",
+        data=json.dumps({"content": content}).encode(),
         headers={
             "Authorization": f"Bot {token}",
             "Content-Type": "application/json",
@@ -151,23 +197,41 @@ def post(section: str, stories: list[dict], token: str) -> None:
         },
     )
     with urllib.request.urlopen(req) as r:
-        log.info("Posted %s (%d stories) -> HTTP %s", section, len(fields), r.status)
+        r.read()
+
+
+def post_section(section: str, stories: list[dict], token: str) -> int:
+    posted = 0
+    for s in stories[:5]:
+        x_url = (s.get("x_url") or "").strip()
+        article = (s.get("article_url") or "").strip()
+        if X_URL_RE.match(x_url) and tweet_exists(x_url):
+            # historical Politics Bot format: bare X link -> rich tweet card
+            content = x_url
+        elif article.startswith("http") and url_alive(article):
+            content = f"**{s['title'].strip()}**\n{article}"
+        else:
+            log.warning("Skipping story, nothing validated: %s (x=%s, article=%s)",
+                        s.get("title"), x_url or "-", article or "-")
+            continue
+        try:
+            send(CHANNELS[section], content, token)
+            posted += 1
+            time.sleep(1.5)
+        except Exception:
+            log.exception("Failed to post story in %s", section)
+    log.info("Posted %d stories to %s", posted, section)
+    return posted
 
 
 def main() -> None:
     setup_logging()
-    token = (BASE_DIR / ".env").read_text().split("=", 1)[1].strip()
+    token = politics_bot_token()
     data = gather()
-    failures = 0
-    for section in CHANNELS:
-        try:
-            post(section, data[section], token)
-        except Exception:
-            log.exception("Failed to post %s", section)
-            failures += 1
-    if failures:
+    total = sum(post_section(section, data[section], token) for section in CHANNELS)
+    if total == 0:
         sys.exit(1)
-    log.info("Digest complete.")
+    log.info("Digest complete: %d stories.", total)
 
 
 if __name__ == "__main__":
