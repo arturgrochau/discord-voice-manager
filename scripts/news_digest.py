@@ -86,8 +86,13 @@ SkyNews, BBCWorld, BBCBreaking, FT, Bloomberg, WSJ, POLITICOEurope,
 euronews, DWNews, visegrad24, MarioNawfal, RadioGenoa, disclosetv,
 spectatorindex, BRICSinfo, GlobeEyeNews, AFpost, EndWokeness. Never use
 small unknown accounts or non-English posts. @elonmusk is a priority
-source — check his recent posts (site:x.com/elonmusk) and include any that
-are relevant to today's stories."""
+source — always check his recent posts (site:x.com/elonmusk) and include
+any that are relevant to today's stories. Also check the accounts of major
+European political figures he engages with — Farage, Weidel, Salvini,
+Abascal, Orbán, Wilders, Meloni — and prefer their takes on European
+sovereignty and migration stories when they posted about today's news.
+
+{skip_note}"""
 
 STRUCTURE_PROMPT = """Convert the following researched news list into JSON.
 Sections: world_events (3 stories), europe_news (4), econ_tech (3).
@@ -99,6 +104,18 @@ them.
 {research}"""
 
 log = logging.getLogger("news-digest")
+HISTORY_PATH = BASE_DIR / "digest_history.json"
+
+
+def load_history() -> list[str]:
+    try:
+        return json.loads(HISTORY_PATH.read_text())
+    except Exception:
+        return []
+
+
+def save_history(urls: list[str]) -> None:
+    HISTORY_PATH.write_text(json.dumps(urls[-300:]))
 
 
 def setup_logging() -> None:
@@ -182,8 +199,14 @@ def gather(max_attempts: int = 3) -> dict:
     for attempt in range(1, max_attempts + 1):
         log.info("Digest attempt %d/%d: research phase", attempt, max_attempts)
         try:
+            recent = load_history()
+            skip_note = ""
+            if recent:
+                skip_note = ("Already covered recently (do NOT reuse these URLs or "
+                             "re-report the same stories): " + " ".join(recent[-40:]))
             research_raw = run_grok(
-                RESEARCH_PROMPT.format(date=datetime.now().strftime("%A, %d %B %Y"))
+                RESEARCH_PROMPT.format(date=datetime.now().strftime("%A, %d %B %Y"),
+                                       skip_note=skip_note)
             )
             research = extract_text_field(research_raw)
             log.info("Research phase returned %d chars; structuring", len(research))
@@ -205,7 +228,7 @@ def validate_stories(data: dict) -> dict:
     Also dedupes across sections — grok sometimes files one story under two.
     """
     out: dict = {}
-    seen: set[str] = set()
+    seen: set[str] = set(load_history())
     for section in CHANNELS:
         kept = []
         for s in (data.get(section) or [])[:5]:
@@ -242,6 +265,9 @@ MIXED_ACCOUNTS = {
     "visegrad24", "marionawfal", "radiogenoa", "disclosetv", "bricsinfo",
     "globeeyenews", "afpost", "endwokeness", "europeinvasionn", "idf",
     "zelenskyyua", "emmanuelmacron",
+    # major European right-leaning political figures (per server curation)
+    "nigel_farage", "alice_weidel", "matteosalvinimi", "santi_abascal",
+    "pm_viktororban", "geertwilderspvv", "georgiameloni",
 }
 ACCOUNT_ALLOWLIST = ENGLISH_SAFE_ACCOUNTS | MIXED_ACCOUNTS
 
@@ -326,6 +352,8 @@ def main() -> None:
     token = politics_bot_token()
     data = gather()
     total = sum(post_section(section, data[section], token) for section in CHANNELS)
+    posted_urls = [s["content"].split("\n")[-1] for sec in data.values() for s in sec]
+    save_history(load_history() + posted_urls)
     if total == 0:
         sys.exit(1)
     log.info("Digest complete: %d stories.", total)

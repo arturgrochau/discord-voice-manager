@@ -51,6 +51,28 @@ def load_config() -> dict:
         return json.load(f)
 
 
+class TidyContext(commands.Context):
+    """Command responses self-destruct after 15s so channels stay clean.
+
+    Ephemeral interaction replies are untouched (they vanish on their own),
+    and cogs can opt out per-message by passing delete_after explicitly.
+    """
+
+    TTL = 15
+
+    def _tidy_kwargs(self, kwargs: dict) -> dict:
+        if kwargs.get("ephemeral"):
+            return kwargs
+        kwargs.setdefault("delete_after", self.TTL)
+        return kwargs
+
+    async def send(self, content=None, **kwargs):
+        return await super().send(content, **self._tidy_kwargs(kwargs))
+
+    async def reply(self, content=None, **kwargs):
+        return await super().reply(content, **self._tidy_kwargs(kwargs))
+
+
 class Sentinel(commands.Bot):
     def __init__(self, config: dict):
         intents = discord.Intents.default()
@@ -86,6 +108,17 @@ class Sentinel(commands.Bot):
             self.tree.copy_global_to(guild=guild)
             synced = await self.tree.sync(guild=guild)
             log.info("Synced %d app commands to guild %s", len(synced), self.guild_id)
+
+    async def get_context(self, message, *, cls=TidyContext):
+        return await super().get_context(message, cls=cls)
+
+    async def on_command_completion(self, ctx) -> None:
+        # prefix invocations get cleaned up; slash invocations have no message
+        if ctx.interaction is None:
+            try:
+                await ctx.message.delete(delay=TidyContext.TTL)
+            except discord.HTTPException:
+                pass
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s (%s)", self.user, self.user.id)

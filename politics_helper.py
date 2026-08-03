@@ -22,15 +22,16 @@ import json
 import logging
 import logging.handlers
 import re
+import os
 import sys
 import time
 from pathlib import Path
 
 import discord
 
-BASE_DIR = Path(__file__).resolve().parent
+# HELPER_HOME lets other servers run their own instance off this codebase.
+BASE_DIR = Path(os.environ.get("HELPER_HOME", Path(__file__).resolve().parent))
 CONFIG_PATH = BASE_DIR / "politics_helper.json"
-NADEKO_CREDS = Path.home() / "Projects/nadekobot/nadeko-osx-arm64/data/creds.yml"
 
 log = logging.getLogger("politics-helper")
 
@@ -57,9 +58,13 @@ def load_config() -> dict:
         return json.load(f)
 
 
-def politics_bot_token() -> str:
-    creds = NADEKO_CREDS.read_text()
-    return re.search(r"^token:\s*'?([A-Za-z0-9_.\-]+)'?", creds, re.M).group(1)
+def politics_bot_token(config: dict) -> str:
+    src = Path(config.get("TOKEN_FILE",
+                          Path.home() / "Projects/nadekobot/nadeko-osx-arm64/data/creds.yml"))
+    text = src.read_text()
+    m = re.search(r"^token:\s*'?([A-Za-z0-9_.\-]+)'?", text, re.M) \
+        or re.search(r"DISCORD_BOT_TOKEN=([A-Za-z0-9_.\-]+)", text)
+    return m.group(1)
 
 
 TEMP_VC_PREFIX = "🔊│"
@@ -70,7 +75,7 @@ REMINDER_TTL = 3 * 60 * 60   # general-chat reminder self-destructs after 3h
 AWARD_TTL = 24 * 60 * 60     # award announcements clean up after a day
 QUOTE_INTERVAL = 4 * 60 * 60
 NADEKO_DB = Path.home() / "Projects/nadekobot/nadeko-osx-arm64/data/NadekoBot.db"
-QUOTES_PATH = BASE_DIR / "philosophy_quotes.json"
+QUOTES_PATH = Path(__file__).resolve().parent / "philosophy_quotes.json"
 
 
 class Helper(discord.Client):
@@ -92,6 +97,9 @@ class Helper(discord.Client):
         self._bump_task = None
         self._last_reward_at = 0.0
         self._reminder_msgs: list = []  # live reminder messages to clear on bump
+        # ordered low -> high; gaining a higher rung removes all lower ones
+        self.ladder: list[int] = [int(r) for r in config.get("LADDER", [])]
+        self._spawning: set[int] = set()  # members mid-room-creation (debounce)
 
     async def on_ready(self):
         log.info("Politics helper online as %s (%s)", self.user, self.user.id)
@@ -287,6 +295,26 @@ class Helper(discord.Client):
                 log.warning("Quote post failed: %s", e)
             await asyncio.sleep(QUOTE_INTERVAL)
 
+    # -- ladder promotions -------------------------------------------------
+
+    async def on_member_update(self, before, after):
+        """Promotion semantics for the level ladder: keep only the highest rung."""
+        if not self.ladder or after.guild.id != self.guild_id:
+            return
+        before_ids = {r.id for r in before.roles}
+        gained = [r for r in self.ladder if r in {x.id for x in after.roles} and r not in before_ids]
+        if not gained:
+            return
+        top = max(self.ladder.index(r) for r in gained)
+        lower = [after.guild.get_role(r) for r in self.ladder[:top]]
+        lower = [r for r in lower if r and r in after.roles]
+        if lower:
+            try:
+                await after.remove_roles(*lower, reason="Ladder promotion: superseded rank removed")
+                log.info("Promoted %s: removed %s", after, [r.name for r in lower])
+            except discord.HTTPException as e:
+                log.warning("Ladder cleanup failed for %s: %s", after, e)
+
     # -- reaction roles ----------------------------------------------------
 
     def _lookup(self, payload) -> int | None:
@@ -339,8 +367,11 @@ class Helper(discord.Client):
     async def on_voice_state_update(self, member, before, after):
         if member.bot:
             return
-        # spawn a room
+        # spawn a room (debounced: duplicate voice events arrive while moving)
         if after.channel and after.channel.id == self.trigger_id:
+            if member.id in self._spawning:
+                return
+            self._spawning.add(member.id)
             guild = member.guild
             category = guild.get_channel(self.category_id)
             name = f"{TEMP_VC_PREFIX}{member.display_name}'s room"[:100]
@@ -367,6 +398,8 @@ class Helper(discord.Client):
                 log.info("Created temp VC %r for %s", vc.name, member)
             except discord.HTTPException as e:
                 log.warning("Join-to-Create failed for %s: %s", member, e)
+            finally:
+                self.loop.create_task(self._release_spawn(member.id))
             return
         # clean up an emptied room (grace period covers the create->move gap)
         if before.channel and before.channel.id in self.temp_vcs and not before.channel.members:
@@ -374,6 +407,12 @@ class Helper(discord.Client):
                 self.loop.create_task(self._delayed_cleanup(before.channel.id))
                 return
             await self._delete_temp(before.channel)
+
+    async def _release_spawn(self, member_id: int):
+        import asyncio
+
+        await asyncio.sleep(10)
+        self._spawning.discard(member_id)
 
     async def _delayed_cleanup(self, channel_id: int):
         import asyncio
@@ -396,8 +435,9 @@ class Helper(discord.Client):
 
 def main() -> None:
     setup_logging()
-    client = Helper(load_config())
-    client.run(politics_bot_token(), log_handler=None)
+    config = load_config()
+    client = Helper(config)
+    client.run(politics_bot_token(config), log_handler=None)
 
 
 if __name__ == "__main__":
