@@ -615,7 +615,7 @@ class RoomPanel(discord.ui.View):
         if mgr.minor_role_id:
             btn = discord.ui.Button(label="Minors", emoji="🔞",
                                     style=discord.ButtonStyle.secondary,
-                                    custom_id="vcr:minors", row=1)
+                                    custom_id="vcr:minors", row=3)
             async def _minors(interaction: discord.Interaction):
                 if (vc := await self._guard(interaction)):
                     await self._reply(interaction, await self.mgr.act_nominors(vc, interaction.user), announce=True)
@@ -693,7 +693,7 @@ class RoomPanel(discord.ui.View):
             await interaction.response.send_message(self.mgr.bans_text(vc), ephemeral=True)
 
     @discord.ui.button(label="Mod", emoji="🛡️", style=discord.ButtonStyle.secondary,
-                       custom_id="vcr:mod", row=2)
+                       custom_id="vcr:mod", row=3)
     async def b_mod(self, interaction, _):
         if (vc := await self._guard(interaction)):
             await interaction.response.send_message(
@@ -701,7 +701,7 @@ class RoomPanel(discord.ui.View):
                 view=_MemberAction(self.mgr, vc, "mod"), ephemeral=True)
 
     @discord.ui.button(label="Hush", emoji="🤫", style=discord.ButtonStyle.secondary,
-                       custom_id="vcr:hush", row=2)
+                       custom_id="vcr:hush", row=3)
     async def b_hush(self, interaction, _):
         if (vc := await self._guard(interaction)):
             await interaction.response.send_message(
@@ -709,7 +709,7 @@ class RoomPanel(discord.ui.View):
                 view=_MemberAction(self.mgr, vc, "hush"), ephemeral=True)
 
     @discord.ui.button(label="Random", emoji="🎲", style=discord.ButtonStyle.secondary,
-                       custom_id="vcr:random", row=0)
+                       custom_id="vcr:random", row=1)
     async def b_random(self, interaction, _):
         if (vc := await self._guard(interaction)):
             await self._reply(interaction, await self.mgr.act_random(vc, interaction.user))
