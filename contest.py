@@ -1,0 +1,263 @@
+"""Nitro giveaway contest engine for the Politics Bot helper.
+
+A time-boxed activity contest with a live, self-updating leaderboard:
+
+  score = XP earned since contest start        (chat + voice, via Nadeko's DB)
+        + INVITE_POINTS per invite that sticks (invite-uses diff attribution;
+                                                deducted if the invitee leaves)
+        + VC_POINTS_PER_MIN per minute spent unmuted in voice with at least
+          one other human (no AFK-alone farming)
+
+The leaderboard embed in the contest channel is edited in place every
+UPDATE_MINUTES so members watch their standing move in near-real-time.
+
+Config (politics_helper.json):
+  "CONTEST": {
+    "ACTIVE": true,
+    "CHANNEL_ID": "…",          # where the leaderboard lives
+    "END": "2026-08-31T23:59:00+00:00",
+    "INVITE_POINTS": 400,
+    "VC_POINTS_PER_MIN": 3,
+    "UPDATE_MINUTES": 10
+  }
+
+State (contest_state.json): XP baseline snapshot, invite credits and who
+invited whom, unmuted-VC seconds, and the leaderboard message id — all
+restart-safe. Delete the state file to start a fresh contest.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import sqlite3
+import time
+from datetime import datetime
+from pathlib import Path
+
+import discord
+
+log = logging.getLogger("politics-helper.contest")
+
+MEDALS = ["🥇", "🥈", "🥉"]
+
+
+class Contest:
+    def __init__(self, client: discord.Client, config: dict, base_dir: Path,
+                 nadeko_db: Path, guild_id: int):
+        cfg = config.get("CONTEST", {})
+        self.client = client
+        self.active = bool(cfg.get("ACTIVE"))
+        self.channel_id = int(cfg.get("CHANNEL_ID", 0) or 0)
+        self.end_iso = cfg.get("END", "")
+        self.invite_pts = int(cfg.get("INVITE_POINTS", 400))
+        self.vc_pts = float(cfg.get("VC_POINTS_PER_MIN", 3))
+        self.update_min = max(1, int(cfg.get("UPDATE_MINUTES", 10)))
+        self.nadeko_db = nadeko_db
+        self.guild_id = guild_id
+        self.state_path = base_dir / "contest_state.json"
+        self.state = self._load()
+        self._inv_cache: dict[str, int] = {}
+
+    # -- persistence -------------------------------------------------------
+
+    def _load(self) -> dict:
+        try:
+            return json.loads(self.state_path.read_text())
+        except Exception:
+            return {}
+
+    def _save(self) -> None:
+        self.state_path.write_text(json.dumps(self.state))
+
+    # -- lifecycle ---------------------------------------------------------
+
+    async def start(self) -> None:
+        if not (self.active and self.channel_id):
+            return
+        guild = self.client.get_guild(self.guild_id)
+        if guild is None:
+            return
+        if not self.state:
+            self.state = {
+                "started": time.time(),
+                "baseline": self._xp_snapshot(),
+                "invites": {},       # inviter uid -> count
+                "invited_by": {},    # invitee uid -> inviter uid
+                "vc_seconds": {},    # uid -> seconds unmuted with company
+                "message_id": 0,
+            }
+            self._save()
+            log.info("Contest: NEW contest started, %d users baselined",
+                     len(self.state["baseline"]))
+        try:
+            self._inv_cache = {i.code: i.uses or 0 for i in await guild.invites()}
+            log.info("Contest: %d invites cached", len(self._inv_cache))
+        except discord.HTTPException as e:
+            log.warning("Contest: invite cache failed: %s", e)
+        self.client.loop.create_task(self._vc_loop())
+        self.client.loop.create_task(self._render_loop())
+        log.info("Contest: engine up (update every %d min)", self.update_min)
+
+    def _xp_snapshot(self) -> dict:
+        with sqlite3.connect(f"file:{self.nadeko_db}?mode=ro", uri=True, timeout=10) as db:
+            rows = db.execute("SELECT UserId, Xp FROM UserXpStats WHERE GuildId=?",
+                              (self.guild_id,)).fetchall()
+        return {str(u): x for u, x in rows}
+
+    # -- invite attribution ------------------------------------------------
+
+    async def on_invite_create(self, invite: discord.Invite) -> None:
+        if self.active:
+            self._inv_cache[invite.code] = invite.uses or 0
+
+    async def on_invite_delete(self, invite: discord.Invite) -> None:
+        self._inv_cache.pop(invite.code, None)
+
+    async def on_member_join(self, member: discord.Member) -> None:
+        if not self.active or member.bot or member.guild.id != self.guild_id:
+            return
+        try:
+            invites = await member.guild.invites()
+        except discord.HTTPException:
+            return
+        inviter = None
+        for inv in invites:
+            if (inv.uses or 0) > self._inv_cache.get(inv.code, 0):
+                inviter = inv.inviter
+            self._inv_cache[inv.code] = inv.uses or 0
+        if inviter and not inviter.bot and inviter.id != member.id:
+            uid = str(inviter.id)
+            self.state["invites"][uid] = self.state["invites"].get(uid, 0) + 1
+            self.state["invited_by"][str(member.id)] = uid
+            self._save()
+            log.info("Contest: %s invited %s (+%d pts)", inviter, member, self.invite_pts)
+
+    async def on_member_remove(self, member: discord.Member) -> None:
+        if not self.active or member.guild.id != self.guild_id:
+            return
+        inviter = self.state.get("invited_by", {}).pop(str(member.id), None)
+        if inviter is not None:
+            self.state["invites"][inviter] = max(0, self.state["invites"].get(inviter, 0) - 1)
+            self._save()
+            log.info("Contest: invitee %s left, deducted from %s", member, inviter)
+
+    # -- unmuted voice tracking -------------------------------------------
+
+    async def _vc_loop(self) -> None:
+        while self.active:
+            await asyncio.sleep(60)
+            try:
+                guild = self.client.get_guild(self.guild_id)
+                if guild is None:
+                    continue
+                changed = False
+                for vc in guild.voice_channels:
+                    if vc == guild.afk_channel:
+                        continue
+                    humans = [m for m in vc.members if not m.bot]
+                    if len(humans) < 2:
+                        continue  # no points for idling alone
+                    for m in humans:
+                        v = m.voice
+                        if v and not (v.self_mute or v.mute or v.self_deaf or v.deaf):
+                            uid = str(m.id)
+                            self.state["vc_seconds"][uid] = self.state["vc_seconds"].get(uid, 0) + 60
+                            changed = True
+                if changed:
+                    self._save()
+            except Exception:
+                log.exception("Contest: vc loop error")
+
+    # -- scoring & leaderboard --------------------------------------------
+
+    def scores(self) -> list[tuple[int, int, dict]]:
+        """[(uid, points, breakdown)] sorted descending."""
+        current = self._xp_snapshot()
+        baseline = self.state.get("baseline", {})
+        uids = set(current) | set(self.state.get("invites", {})) | set(self.state.get("vc_seconds", {}))
+        out = []
+        for uid in uids:
+            xp = max(0, int(current.get(uid, 0)) - int(baseline.get(uid, 0)))
+            inv = self.state.get("invites", {}).get(uid, 0)
+            vc_min = self.state.get("vc_seconds", {}).get(uid, 0) // 60
+            pts = xp + inv * self.invite_pts + int(vc_min * self.vc_pts)
+            if pts > 0:
+                out.append((int(uid), pts, {"xp": xp, "inv": inv, "vc": vc_min}))
+        out.sort(key=lambda t: -t[1])
+        return out
+
+    def _end_ts(self) -> int:
+        try:
+            return int(datetime.fromisoformat(self.end_iso).timestamp())
+        except Exception:
+            return 0
+
+    def build_embed(self, guild: discord.Guild) -> discord.Embed:
+        rows = []
+        for i, (uid, pts, b) in enumerate(self.scores()[:10]):
+            badge = MEDALS[i] if i < 3 else f"**{i + 1}.**"
+            detail = f"{b['xp']:,} XP"
+            if b["inv"]:
+                detail += f" · {b['inv']} invite{'s' if b['inv'] != 1 else ''}"
+            if b["vc"]:
+                detail += f" · {b['vc']}m voice"
+            rows.append(f"{badge} <@{uid}> — **{pts:,} pts**  ·  {detail}")
+        if not rows:
+            rows = ["*Nobody has scored yet — the race is wide open.*"]
+        end = self._end_ts()
+        when = f"<t:{end}:D> (<t:{end}:R>)" if end else "TBA"
+        e = discord.Embed(
+            title="🎁 NITRO GIVEAWAY — Live Standings",
+            description=(
+                "\n".join(rows)
+                + "\n\n**How to score**\n"
+                "• Every XP you earn counts (chat **and** voice — voice pays ~3× faster)\n"
+                f"• Each friend you invite who stays: **+{self.invite_pts} pts**\n"
+                f"• Every minute unmuted in voice with others: **+{self.vc_pts:g} pts**\n\n"
+                "**Prizes**\n"
+                "🥇 1 month of Nitro + the **Mythical** role + 🥇 gold medal\n"
+                "🥈 1 month of Nitro + **30,000 XP** + 🥈 silver medal\n"
+                "🥉 1 month of Nitro + **15,000 XP** + 🥉 bronze medal"
+            ),
+            color=0xF47FFF,
+        )
+        e.set_footer(text=f"Winners drawn {when.split('(')[0].strip() if end else 'TBA'} · "
+                          f"standings update every {self.update_min} min")
+        if end:
+            e.description += f"\n\n⏳ **Contest ends {when}**"
+        return e
+
+    async def _render_loop(self) -> None:
+        await asyncio.sleep(10)
+        while self.active:
+            try:
+                await self.render()
+            except Exception:
+                log.exception("Contest: render error")
+            await asyncio.sleep(self.update_min * 60)
+
+    async def render(self) -> None:
+        guild = self.client.get_guild(self.guild_id)
+        channel = self.client.get_channel(self.channel_id)
+        if guild is None or channel is None:
+            return
+        embed = self.build_embed(guild)
+        msg = None
+        if self.state.get("message_id"):
+            try:
+                msg = await channel.fetch_message(self.state["message_id"])
+            except discord.HTTPException:
+                msg = None
+        if msg:
+            await msg.edit(embed=embed)
+        else:
+            msg = await channel.send(embed=embed)
+            self.state["message_id"] = msg.id
+            self._save()
+            try:
+                await msg.pin(reason="Contest leaderboard")
+            except discord.HTTPException:
+                pass
+        log.info("Contest: leaderboard rendered (%d scorers)", len(self.scores()))

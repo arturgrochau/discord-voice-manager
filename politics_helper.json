@@ -58,5 +58,13 @@
   "VC_LOG_CHANNEL_ID": "1297969981861924934",
   "PANEL_COLOR": "0xC0A062",
   "PANEL_EMBLEM": "\ud83c\udfdb\ufe0f",
-  "NADEKO_DB_PATH": "~/Projects/nadekobot/nadeko-osx-arm64/data/NadekoBot.db"
+  "NADEKO_DB_PATH": "~/Projects/nadekobot/nadeko-osx-arm64/data/NadekoBot.db",
+  "CONTEST": {
+    "ACTIVE": true,
+    "CHANNEL_ID": "1297280889813733407",
+    "END": "2026-08-31T23:59:00+00:00",
+    "INVITE_POINTS": 400,
+    "VC_POINTS_PER_MIN": 3,
+    "UPDATE_MINUTES": 2
+  }
 }

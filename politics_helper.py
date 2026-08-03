@@ -35,6 +35,7 @@ import discord
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import vc_rooms  # noqa: E402  (TempVoice-style room control panel)
+import contest as contest_mod  # noqa: E402  (nitro giveaway engine)
 
 # HELPER_HOME lets other servers run their own instance off this codebase.
 BASE_DIR = Path(os.environ.get("HELPER_HOME", Path(__file__).resolve().parent))
@@ -108,6 +109,7 @@ class Helper(discord.Client):
         # TempVoice-style room control (panel, ..commands, saved prefs)
         self.rooms = vc_rooms.RoomManager(self, config, BASE_DIR)
         self.rooms.delete_cb = self._delete_temp
+        self.contest = contest_mod.Contest(self, config, BASE_DIR, self.nadeko_db, self.guild_id)
         # ordered low -> high; gaining a higher rung removes all lower ones
         self.ladder: list[int] = [int(r) for r in config.get("LADDER", [])]
         self._spawning: set[int] = set()  # members mid-room-creation (debounce)
@@ -145,6 +147,7 @@ class Helper(discord.Client):
         if self.ladder and self.config.get("LADDER_MIN_RANK_DAYS"):
             self.loop.create_task(self._pending_promotions_loop())
         await self.rooms.start()
+        await self.contest.start()
         # every live room is delete-tracked, whatever it was renamed to
         for cid in self.rooms.rooms:
             self.temp_vcs.setdefault(int(cid), time.monotonic())
@@ -524,6 +527,20 @@ class Helper(discord.Client):
             except discord.HTTPException as e:
                 log.warning("Quote post failed: %s", e)
             await asyncio.sleep(QUOTE_INTERVAL)
+
+    # -- contest event forwarding ------------------------------------------
+
+    async def on_member_join(self, member):
+        await self.contest.on_member_join(member)
+
+    async def on_member_remove(self, member):
+        await self.contest.on_member_remove(member)
+
+    async def on_invite_create(self, invite):
+        await self.contest.on_invite_create(invite)
+
+    async def on_invite_delete(self, invite):
+        await self.contest.on_invite_delete(invite)
 
     # -- ladder promotions -------------------------------------------------
     # Promotion keeps only the highest rung. Optionally (LADDER_MIN_RANK_DAYS)
