@@ -260,13 +260,30 @@ class RoomManager:
         await self.client.http.request(route, json={"status": status[:500]})
 
     @staticmethod
-    def _resolve_member(guild: discord.Guild, token: str) -> discord.Member | None:
+    def _resolve_member(guild: discord.Guild, token: str,
+                        vc: discord.VoiceChannel | None = None) -> discord.Member | None:
+        """Mention/id, else name matching — room members first, then the guild.
+
+        Match order per pool: exact name/display -> unique prefix -> unique
+        substring, all case-insensitive, so `..mod half` finds `halfway`.
+        """
         token = token.strip().lstrip("<@!&").rstrip(">")
         if token.isdigit():
             return guild.get_member(int(token))
-        return discord.utils.find(
-            lambda m: m.name.lower() == token.lower() or m.display_name.lower() == token.lower(),
-            guild.members)
+        t = token.casefold()
+        pools = ([list(vc.members)] if vc else []) + [guild.members]
+        for pool in pools:
+            names = [(m, m.name.casefold(), m.display_name.casefold()) for m in pool]
+            for m, n, d in names:
+                if t in (n, d):
+                    return m
+            starts = [m for m, n, d in names if n.startswith(t) or d.startswith(t)]
+            if len(starts) == 1:
+                return starts[0]
+            subs = [m for m, n, d in names if t in n or t in d]
+            if len(subs) == 1:
+                return subs[0]
+        return None
 
     # -- actions (shared by buttons and ..commands) ------------------------
 
@@ -542,9 +559,10 @@ class RoomManager:
 
         async def need_member(fn, *extra):
             tokens = arg.split()
-            member = self._resolve_member(message.guild, tokens[0]) if tokens else None
+            member = self._resolve_member(message.guild, tokens[0], vc) if tokens else None
             if member is None:
-                return f"Usage: `..{cmd} <@user or id>`"
+                return (f"Couldn't find **{tokens[0]}** — try a mention, exact name, or id."
+                        if tokens else f"Usage: `..{cmd} <name, @user or id>`")
             return await fn(vc, actor, member, *extra)
 
         try:
@@ -602,32 +620,62 @@ class RoomManager:
 
 
 class _MemberAction(discord.ui.View):
-    """Ephemeral user-picker for actions that need a target member."""
+    """Ephemeral picker listing only the members the action can apply to.
+
+    mod / hush act as toggles: picking someone who already has the state
+    removes it (labels mark current state with ✓).
+    """
 
     def __init__(self, mgr: RoomManager, vc, action: str, minutes: int = 0):
         super().__init__(timeout=120)
         self.mgr, self.vc, self.action, self.minutes = mgr, vc, action, minutes
-        picker = discord.ui.UserSelect(placeholder="Pick a member…")
+        state = mgr.room(vc.id) or {}
+        options = []
+        if action == "unban":
+            for uid in state.get("bans", {}):
+                m = vc.guild.get_member(int(uid))
+                options.append(discord.SelectOption(
+                    label=(m.display_name if m else f"user {uid}")[:100], value=str(uid)))
+        else:
+            marked = set(state.get("mods", []) if action == "mod"
+                         else state.get("hushed", []) if action == "hush" else [])
+            for m in vc.members:
+                if m.bot or m.id == state.get("owner"):
+                    continue
+                options.append(discord.SelectOption(
+                    label=m.display_name[:100], value=str(m.id),
+                    description="✓ currently" if m.id in marked else None))
+        self.empty = not options
+        if self.empty:
+            return
+        picker = discord.ui.Select(placeholder="Pick a member…", options=options[:25])
         picker.callback = self._picked
         self.add_item(picker)
 
     async def _picked(self, interaction: discord.Interaction):
-        target = self.children[0].values[0]
-        member = interaction.guild.get_member(target.id)
+        member = interaction.guild.get_member(int(self.children[0].values[0]))
         if member is None:
-            return await interaction.response.send_message("Member not found.", ephemeral=True)
-        fn = {
-            "ban": lambda: self.mgr.act_ban(self.vc, interaction.user, member, self.minutes),
-            "unban": lambda: self.mgr.act_unban(self.vc, interaction.user, member),
-            "kick": lambda: self.mgr.act_kick(self.vc, interaction.user, member),
-            "mod": lambda: self.mgr.act_mod(self.vc, interaction.user, member, True),
-            "demod": lambda: self.mgr.act_mod(self.vc, interaction.user, member, False),
-            "hush": lambda: self.mgr.act_hush(self.vc, interaction.user, member, True),
-            "transfer": lambda: self.mgr.act_transfer(self.vc, interaction.user, member),
-        }[self.action]
-        out = await fn()
+            return await interaction.response.edit_message(
+                content="They're no longer around.", view=None)
+        state = self.mgr.room(self.vc.id) or {}
+        if self.action == "mod":
+            out = await self.mgr.act_mod(self.vc, interaction.user, member,
+                                         member.id not in state.get("mods", []))
+        elif self.action == "hush":
+            out = await self.mgr.act_hush(self.vc, interaction.user, member,
+                                          member.id not in state.get("hushed", []))
+        else:
+            fn = {
+                "ban": lambda: self.mgr.act_ban(self.vc, interaction.user, member, self.minutes),
+                "unban": lambda: self.mgr.act_unban(self.vc, interaction.user, member),
+                "kick": lambda: self.mgr.act_kick(self.vc, interaction.user, member),
+                "transfer": lambda: self.mgr.act_transfer(self.vc, interaction.user, member),
+            }[self.action]
+            out = await fn()
+        # one output only: the picker itself becomes the result
         await interaction.response.edit_message(content=out, view=None)
-        if out.startswith(("🔨", "♻️", "🛡️", "👑", "🤫", "👢")):
+        # ownership changes matter to everyone present — announce those once
+        if self.action == "transfer" and out.startswith("👑"):
             try:
                 await self.vc.send(out)
             except discord.HTTPException:
@@ -684,9 +732,12 @@ class RoomPanel(discord.ui.View):
                                  custom_id="vcr:kick", row=2)
         async def _kick(interaction: discord.Interaction):
             if (vc := await self._guard(interaction)):
+                view = _MemberAction(self.mgr, vc, "kick")
+                if view.empty:
+                    return await interaction.response.send_message(
+                        "Nobody else is in the room to kick.", ephemeral=True)
                 await interaction.response.send_message(
-                    "Who gets kicked from the room? (they can rejoin unless banned)",
-                    view=_MemberAction(self.mgr, vc, "kick"), ephemeral=True)
+                    "Kick who? (they can rejoin unless banned)", view=view, ephemeral=True)
         kick.callback = _kick
         self.add_item(kick)
 
@@ -699,12 +750,10 @@ class RoomPanel(discord.ui.View):
         return vc
 
     async def _reply(self, interaction, out: str, announce: bool = False):
-        await interaction.response.send_message(out, ephemeral=True)
-        if announce:
-            try:
-                await interaction.channel.send(out)
-            except discord.HTTPException:
-                pass
+        if announce and not out.startswith(("⛔", "⚠️")):
+            await interaction.response.send_message(out)   # public, exactly once
+        else:
+            await interaction.response.send_message(out, ephemeral=True)
 
     @discord.ui.button(label="Rename", emoji="📝", style=discord.ButtonStyle.primary,
                        custom_id="vcr:rename", row=0)
@@ -743,16 +792,23 @@ class RoomPanel(discord.ui.View):
                        custom_id="vcr:ban", row=2)
     async def b_ban(self, interaction, _):
         if (vc := await self._guard(interaction)):
+            view = _MemberAction(self.mgr, vc, "ban")
+            if view.empty:
+                return await interaction.response.send_message(
+                    "Nobody else is in the room — `..ban <name> [minutes]` works for anyone.", ephemeral=True)
             await interaction.response.send_message(
-                "Who do you want to ban? (tip: `..ban @user 30` for a 30-min ban)",
-                view=_MemberAction(self.mgr, vc, "ban"), ephemeral=True)
+                "Ban who? (`..ban <name> 30` = 30-min ban, works for absent members too)",
+                view=view, ephemeral=True)
 
     @discord.ui.button(label="Unban", emoji="♻️", style=discord.ButtonStyle.secondary,
                        custom_id="vcr:unban", row=2)
     async def b_unban(self, interaction, _):
         if (vc := await self._guard(interaction)):
-            await interaction.response.send_message(
-                "Who do you want to unban?", view=_MemberAction(self.mgr, vc, "unban"), ephemeral=True)
+            view = _MemberAction(self.mgr, vc, "unban")
+            if view.empty:
+                return await interaction.response.send_message(
+                    "Nobody is banned from this room. 🎉", ephemeral=True)
+            await interaction.response.send_message("Unban who?", view=view, ephemeral=True)
 
     @discord.ui.button(label="Bans", emoji="📋", style=discord.ButtonStyle.secondary,
                        custom_id="vcr:bans", row=3)
@@ -764,17 +820,23 @@ class RoomPanel(discord.ui.View):
                        custom_id="vcr:mod", row=3)
     async def b_mod(self, interaction, _):
         if (vc := await self._guard(interaction)):
+            view = _MemberAction(self.mgr, vc, "mod")
+            if view.empty:
+                return await interaction.response.send_message(
+                    "Nobody else is in the room to promote.", ephemeral=True)
             await interaction.response.send_message(
-                "Who becomes a room mod? (`..demod @user` to remove)",
-                view=_MemberAction(self.mgr, vc, "mod"), ephemeral=True)
+                "Toggle room mod for… (✓ marks current mods)", view=view, ephemeral=True)
 
     @discord.ui.button(label="Hush", emoji="🤫", style=discord.ButtonStyle.secondary,
                        custom_id="vcr:hush", row=3)
     async def b_hush(self, interaction, _):
         if (vc := await self._guard(interaction)):
+            view = _MemberAction(self.mgr, vc, "hush")
+            if view.empty:
+                return await interaction.response.send_message(
+                    "Nobody else is in the room to hush.", ephemeral=True)
             await interaction.response.send_message(
-                "Who gets hushed in this chat? (`..unhush @user` to undo)",
-                view=_MemberAction(self.mgr, vc, "hush"), ephemeral=True)
+                "Toggle hush for… (✓ marks currently hushed)", view=view, ephemeral=True)
 
     @discord.ui.button(label="Claim", emoji="👑", style=discord.ButtonStyle.success,
                        custom_id="vcr:claim", row=4)
@@ -786,9 +848,11 @@ class RoomPanel(discord.ui.View):
                        custom_id="vcr:transfer", row=4)
     async def b_transfer(self, interaction, _):
         if (vc := await self._guard(interaction)):
-            await interaction.response.send_message(
-                "Transfer ownership to whom? (must be in the room)",
-                view=_MemberAction(self.mgr, vc, "transfer"), ephemeral=True)
+            view = _MemberAction(self.mgr, vc, "transfer")
+            if view.empty:
+                return await interaction.response.send_message(
+                    "Nobody else is in the room to transfer to.", ephemeral=True)
+            await interaction.response.send_message("Transfer ownership to…", view=view, ephemeral=True)
 
     @discord.ui.button(label="Abandon", emoji="🏳️", style=discord.ButtonStyle.danger,
                        custom_id="vcr:abandon", row=4)
