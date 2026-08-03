@@ -22,7 +22,7 @@ Config (politics_helper.json):
   }
 
 State (contest_state.json): XP baseline snapshot, invite credits and who
-invited whom, unmuted-VC seconds, and the leaderboard message id — all
+invited whom, unmuted-VC seconds, and the leaderboard message id, all
 restart-safe. Delete the state file to start a fresh contest.
 """
 
@@ -59,6 +59,7 @@ class Contest:
         self.state_path = base_dir / "contest_state.json"
         self.state = self._load()
         self._inv_cache: dict[str, int] = {}
+        self._last_msg: dict[str, float] = {}  # anti-spam window (30 s)
 
     # -- persistence -------------------------------------------------------
 
@@ -86,6 +87,7 @@ class Contest:
                 "invites": {},       # inviter uid -> count
                 "invited_by": {},    # invitee uid -> inviter uid
                 "vc_seconds": {},    # uid -> seconds unmuted with company
+                "messages": {},      # uid -> counted messages (30 s window)
                 "message_id": 0,
             }
             self._save()
@@ -143,6 +145,21 @@ class Contest:
             self._save()
             log.info("Contest: invitee %s left, deducted from %s", member, inviter)
 
+    # -- message counting (display only; XP already scores messages) ------
+
+    async def on_message(self, message: discord.Message) -> None:
+        if not self.active or message.author.bot or message.guild is None \
+                or message.guild.id != self.guild_id:
+            return
+        uid = str(message.author.id)
+        now = time.time()
+        if now - self._last_msg.get(uid, 0) < 30:
+            return
+        self._last_msg[uid] = now
+        msgs = self.state.setdefault("messages", {})
+        msgs[uid] = msgs.get(uid, 0) + 1
+        self._save()
+
     # -- unmuted voice tracking -------------------------------------------
 
     async def _vc_loop(self) -> None:
@@ -182,9 +199,10 @@ class Contest:
             xp = max(0, int(current.get(uid, 0)) - int(baseline.get(uid, 0)))
             inv = self.state.get("invites", {}).get(uid, 0)
             vc_min = self.state.get("vc_seconds", {}).get(uid, 0) // 60
+            msgs = self.state.get("messages", {}).get(uid, 0)
             pts = xp + inv * self.invite_pts + int(vc_min * self.vc_pts)
-            if pts > 0:
-                out.append((int(uid), pts, {"xp": xp, "inv": inv, "vc": vc_min}))
+            if pts > 0 or msgs > 0:
+                out.append((int(uid), pts, {"xp": xp, "inv": inv, "vc": vc_min, "msgs": msgs}))
         out.sort(key=lambda t: -t[1])
         return out
 
@@ -195,38 +213,44 @@ class Contest:
             return 0
 
     def build_embed(self, guild: discord.Guild) -> discord.Embed:
+        ranked = self.scores()[:10]
         rows = []
-        for i, (uid, pts, b) in enumerate(self.scores()[:10]):
+        for i in range(10):
             badge = MEDALS[i] if i < 3 else f"**{i + 1}.**"
-            detail = f"{b['xp']:,} XP"
-            if b["inv"]:
-                detail += f" · {b['inv']} invite{'s' if b['inv'] != 1 else ''}"
-            if b["vc"]:
-                detail += f" · {b['vc']}m voice"
-            rows.append(f"{badge} <@{uid}> — **{pts:,} pts**  ·  {detail}")
-        if not rows:
-            rows = ["*Nobody has scored yet — the race is wide open.*"]
+            if i < len(ranked):
+                uid, pts, b = ranked[i]
+                bits = []
+                if b["msgs"]:
+                    bits.append(f"{b['msgs']} msg{'s' if b['msgs'] != 1 else ''}")
+                if b["vc"]:
+                    bits.append(f"{b['vc']} min voice")
+                if b["inv"]:
+                    bits.append(f"{b['inv']} invite{'s' if b['inv'] != 1 else ''}")
+                detail = f"  ({' / '.join(bits)})" if bits else ""
+                rows.append(f"{badge} <@{uid}> · **{pts:,} pts**{detail}")
+            else:
+                rows.append(f"{badge} *no one yet, could be you*")
         end = self._end_ts()
-        when = f"<t:{end}:D> (<t:{end}:R>)" if end else "TBA"
         e = discord.Embed(
-            title="🎁 NITRO GIVEAWAY — Live Standings",
+            title="🎁 Nitro Giveaway · Live Standings",
             description=(
                 "\n".join(rows)
                 + "\n\n**How to score**\n"
-                "• Every XP you earn counts (chat **and** voice — voice pays ~3× faster)\n"
+                "• All XP you earn counts. Chat and voice both work, voice pays ~3x faster\n"
                 f"• Each friend you invite who stays: **+{self.invite_pts} pts**\n"
                 f"• Every minute unmuted in voice with others: **+{self.vc_pts:g} pts**\n\n"
                 "**Prizes**\n"
-                "🥇 1 month of Nitro + the **Mythical** role + 🥇 gold medal\n"
-                "🥈 1 month of Nitro + **30,000 XP** + 🥈 silver medal\n"
-                "🥉 1 month of Nitro + **15,000 XP** + 🥉 bronze medal"
+                "🥇 1 month of Nitro + the **Mythical** role + gold medal\n"
+                "🥈 1 month of Nitro + **30,000 XP** + silver medal\n"
+                "🥉 1 month of Nitro + **15,000 XP** + bronze medal\n\n"
+                "-# Anti-spam: only one message every 30 seconds counts.\n"
+                "-# Numbers look off? DM the bot and the mod team will adjust manually."
             ),
             color=0xF47FFF,
         )
-        e.set_footer(text=f"Winners drawn {when.split('(')[0].strip() if end else 'TBA'} · "
-                          f"standings update every {self.update_min} min")
         if end:
-            e.description += f"\n\n⏳ **Contest ends {when}**"
+            e.description += f"\n\n⏳ **Contest ends <t:{end}:D> (<t:{end}:R>)**"
+        e.set_footer(text=f"Standings update every {self.update_min} min")
         return e
 
     async def _render_loop(self) -> None:

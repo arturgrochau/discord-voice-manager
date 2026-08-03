@@ -272,6 +272,7 @@ class Helper(discord.Client):
             if not message.author.bot:
                 await self._modmail_outbound(message)
             return
+        await self.contest.on_message(message)
         # ..commands inside a temp room's chat
         if str(message.channel.id) in self.rooms.rooms and not message.author.bot:
             await self.rooms.handle_message(message)
