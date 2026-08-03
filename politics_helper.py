@@ -81,7 +81,7 @@ BUMP_XP = 200          # very generous: ~50 messages worth of XP
 REMINDER_TTL = 3 * 60 * 60   # general-chat reminder self-destructs after 3h
 AWARD_TTL = 24 * 60 * 60     # award announcements clean up after a day
 QUOTE_INTERVAL = 4 * 60 * 60
-NADEKO_DB = Path.home() / "Projects/nadekobot/nadeko-osx-arm64/data/NadekoBot.db"
+DEFAULT_NADEKO_DB = Path.home() / "Projects/nadekobot/nadeko-osx-arm64/data/NadekoBot.db"
 QUOTES_PATH = Path(__file__).resolve().parent / "philosophy_quotes.json"
 
 
@@ -104,6 +104,7 @@ class Helper(discord.Client):
         self._bump_task = None
         self._last_reward_at = 0.0
         self._reminder_msgs: list = []  # live reminder messages to clear on bump
+        self.nadeko_db = Path(config.get("NADEKO_DB_PATH", DEFAULT_NADEKO_DB)).expanduser()
         # TempVoice-style room control (panel, ..commands, saved prefs)
         self.rooms = vc_rooms.RoomManager(self, config, BASE_DIR)
         self.rooms.delete_cb = self._delete_temp
@@ -184,6 +185,7 @@ class Helper(discord.Client):
             if m.author.id == self.user.id and "Bump available" in (m.content or ""):
                 reminder_after_bump = True
         if last_bump is None:
+            await self._post_bump_reminder()
             return
         elapsed = (datetime.now(timezone.utc) - last_bump).total_seconds()
         if elapsed < BUMP_COOLDOWN:
@@ -223,12 +225,26 @@ class Helper(discord.Client):
             except discord.HTTPException:
                 pass
         self._reminder_msgs = []
+        # restart-proof: reminders posted by a previous process aren't in the
+        # list above — sweep both channels for our own reminder messages
+        for channel_id in (self.bump_channel_id, self.general_channel_id):
+            channel = self.get_channel(channel_id)
+            if channel is None:
+                continue
+            try:
+                async for m in channel.history(limit=30):
+                    if m.author.id == self.user.id and (
+                            "Bump available" in (m.content or "")
+                            or "can be bumped again" in (m.content or "")):
+                        await m.delete()
+            except discord.HTTPException:
+                pass
 
     def _award_bump_xp(self, user_id: int, guild_id: int) -> int:
         """Add BUMP_XP to the bumper's Nadeko server XP (WAL-safe upsert)."""
         import sqlite3
 
-        with sqlite3.connect(NADEKO_DB, timeout=10) as db:
+        with sqlite3.connect(self.nadeko_db, timeout=10) as db:
             db.execute(
                 "INSERT INTO UserXpStats (UserId, GuildId, Xp, DateAdded) "
                 "VALUES (?, ?, ?, datetime('now')) "

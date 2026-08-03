@@ -57,5 +57,6 @@
   "RULES_CHANNEL_ID": "783067866823393310",
   "VC_LOG_CHANNEL_ID": "1297969981861924934",
   "PANEL_COLOR": "0xC0A062",
-  "PANEL_EMBLEM": "\ud83c\udfdb\ufe0f"
+  "PANEL_EMBLEM": "\ud83c\udfdb\ufe0f",
+  "NADEKO_DB_PATH": "~/Projects/nadekobot/nadeko-osx-arm64/data/NadekoBot.db"
 }

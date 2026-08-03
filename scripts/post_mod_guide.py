@@ -148,9 +148,9 @@ def build_embeds(s: dict) -> list[dict]:
         f"**Ladder (role · level):** {s['ladder']}\n\n"
         "`;xp` — your card · `;xplb` — leaderboard · `;xprr` — role rewards\n"
         "`;xpadd @user N` — grant XP *(admin)*"
-        + ("\n\n**Disboard bumps:** the first `/bump` when the window opens earns "
-           "**+200 XP** — reminders post automatically and clean themselves up."
-           if s["extras"] else "")
+        + "\n\n**Disboard bumps:** the first `/bump` when the window opens earns "
+          "**+200 XP** — reminders post automatically and vanish the moment "
+          "someone bumps."
     )
     autom = (
         "**🔺 Join to Create** — joining the trigger voice channel spawns a personal "
