@@ -79,7 +79,7 @@ class Moderation(commands.Cog):
 
     # -- detain ------------------------------------------------------------
 
-    @commands.hybrid_command(name="detain", description="Detain a member: restrict them to the detainment channels.")
+    @commands.hybrid_command(name="detain", aliases=["d"], description="Detain a member: restrict them to the detainment channels.")
     @app_commands.describe(member="Member to detain", reason="Why they are being detained")
     @app_commands.default_permissions(manage_roles=True)
     @commands.has_permissions(manage_roles=True)
@@ -109,7 +109,7 @@ class Moderation(commands.Cog):
             self.detain_log,
         )
 
-    @commands.hybrid_command(name="undetain", description="Release a detained member.")
+    @commands.hybrid_command(name="undetain", aliases=["ud"], description="Release a detained member.")
     @app_commands.describe(member="Member to release", reason="Why they are being released")
     @app_commands.default_permissions(manage_roles=True)
     @commands.has_permissions(manage_roles=True)
@@ -181,7 +181,7 @@ class Moderation(commands.Cog):
             or self.mod_log
         )
 
-    @commands.hybrid_command(name="ban", description="Ban a member.")
+    @commands.hybrid_command(name="ban", aliases=["b"], description="Ban a member.")
     @app_commands.describe(member="Member to ban", reason="Reason")
     @app_commands.default_permissions(ban_members=True)
     @commands.has_permissions(ban_members=True)
@@ -196,7 +196,7 @@ class Moderation(commands.Cog):
                                       f"{member.mention} banned by {ctx.author.mention}.\n**Reason:** {reason or '—'}",
                                       RED, member.id), self.ban_log)
 
-    @commands.hybrid_command(name="unban", description="Unban a user by ID or name.")
+    @commands.hybrid_command(name="unban", aliases=["ub"], description="Unban a user by ID or name.")
     @app_commands.describe(user="User ID or username", reason="Reason")
     @app_commands.default_permissions(ban_members=True)
     @commands.has_permissions(ban_members=True)
@@ -220,7 +220,7 @@ class Moderation(commands.Cog):
                                       f"{target.mention} unbanned by {ctx.author.mention}.\n**Reason:** {reason or '—'}",
                                       GREEN, target.id), self.ban_log)
 
-    @commands.hybrid_command(name="kick", description="Kick a member from the server.")
+    @commands.hybrid_command(name="kick", aliases=["k"], description="Kick a member from the server.")
     @app_commands.describe(member="Member to kick", reason="Reason")
     @app_commands.default_permissions(kick_members=True)
     @commands.has_permissions(kick_members=True)
@@ -237,7 +237,7 @@ class Moderation(commands.Cog):
 
     # -- timeouts ----------------------------------------------------------
 
-    @commands.hybrid_command(name="timeout", description="Time a member out (minutes, max 28 days).")
+    @commands.hybrid_command(name="timeout", aliases=["t"], description="Time a member out (minutes, max 28 days).")
     @app_commands.describe(member="Member", minutes="Duration in minutes (max 40320)", reason="Reason")
     @app_commands.default_permissions(moderate_members=True)
     @commands.has_permissions(moderate_members=True)
@@ -253,7 +253,7 @@ class Moderation(commands.Cog):
                                       f"{member.mention} timed out by {ctx.author.mention} until <t:{int(until.timestamp())}:f>.\n**Reason:** {reason or '—'}",
                                       ORANGE, member.id))
 
-    @commands.hybrid_command(name="untimeout", description="Remove a member's timeout.")
+    @commands.hybrid_command(name="untimeout", aliases=["ut"], description="Remove a member's timeout.")
     @app_commands.default_permissions(moderate_members=True)
     @commands.has_permissions(moderate_members=True)
     async def untimeout(self, ctx: commands.Context, member: discord.Member, *, reason: str | None = None):
@@ -265,7 +265,7 @@ class Moderation(commands.Cog):
 
     # -- warnings ----------------------------------------------------------
 
-    @commands.hybrid_command(name="warn", description="Warn a member (recorded permanently).")
+    @commands.hybrid_command(name="warn", aliases=["w"], description="Warn a member (recorded permanently).")
     @app_commands.describe(member="Member to warn", reason="Reason")
     @app_commands.default_permissions(moderate_members=True)
     @commands.has_permissions(moderate_members=True)
@@ -283,7 +283,7 @@ class Moderation(commands.Cog):
                                       f"{member.mention} warned by {ctx.author.mention} (#{warning_id}, total {count}).\n**Reason:** {reason}",
                                       ORANGE, member.id))
 
-    @commands.hybrid_command(name="warnings", description="List a member's warnings.")
+    @commands.hybrid_command(name="warnings", aliases=["ws"], description="List a member's warnings.")
     @app_commands.default_permissions(moderate_members=True)
     @commands.has_permissions(moderate_members=True)
     async def warnings(self, ctx: commands.Context, member: discord.Member):
@@ -294,7 +294,7 @@ class Moderation(commands.Cog):
         embed = mod_embed(f"Warnings — {member.display_name} ({len(rows)})", "\n".join(lines), BLUE, member.id)
         await ctx.reply(embed=embed, ephemeral=True)
 
-    @commands.hybrid_command(name="clearwarnings", description="Clear all warnings for a member.")
+    @commands.hybrid_command(name="clearwarnings", aliases=["cw"], description="Clear all warnings for a member.")
     @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def clearwarnings(self, ctx: commands.Context, member: discord.Member):
@@ -323,7 +323,7 @@ class Moderation(commands.Cog):
         n = await self._do_purge(interaction, interaction.channel, interaction.user, amount, member)
         await interaction.followup.send(f"🧹 Deleted {n} message(s).", ephemeral=True)
 
-    @commands.command(name="purge", aliases=["prune"])
+    @commands.command(name="purge", aliases=["prune", "p"])
     @commands.has_permissions(manage_messages=True)
     async def purge_prefix(self, ctx: commands.Context,
                            first: discord.Member | int,
