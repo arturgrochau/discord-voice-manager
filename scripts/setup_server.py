@@ -18,7 +18,7 @@ from pathlib import Path
 import discord
 from dotenv import load_dotenv
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR = Path(os.environ.get("SENTINEL_HOME", Path(__file__).resolve().parent.parent))
 CONFIG_PATH = BASE_DIR / "config.json"
 
 load_dotenv(BASE_DIR / ".env")

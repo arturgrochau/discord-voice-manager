@@ -80,7 +80,7 @@ class Voice(commands.Cog):
             )
             embed.set_footer(text=f"User ID: {member.id}")
             await self.send_log(embed)
-            await self.try_dm(member, "You were auto-unmuted upon joining a voice channel in Politics & Philosophy.")
+            await self.try_dm(member, f"You were auto-unmuted upon joining a voice channel in {member.guild.name}.")
             return
 
         # Log manual server mutes/unmutes with the acting moderator when findable.

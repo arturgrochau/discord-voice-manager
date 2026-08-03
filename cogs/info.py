@@ -16,9 +16,9 @@ class Info(commands.Cog):
     @commands.hybrid_command(name="credits", description="Bot creator and license information.")
     async def credits(self, ctx: commands.Context):
         embed = discord.Embed(
-            title="P&P Sentinel",
+            title=self.bot.config.get("BOT_NAME", "Sentinel"),
             description=(
-                "Voice management & moderation bot for **Politics & Philosophy**.\n\n"
+                f"Voice management & moderation bot for **{ctx.guild.name}**.\n\n"
                 "Built by **Artur Grochau** — [GitHub](https://github.com/arturgrochau/discord-voice-manager)\n"
                 "Licensed under the MIT License."
             ),

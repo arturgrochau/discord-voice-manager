@@ -15,7 +15,9 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
-BASE_DIR = Path(__file__).resolve().parent
+# SENTINEL_HOME lets a second server run its own instance (config/.env/db/logs)
+# off the same codebase; defaults to the repo directory.
+BASE_DIR = Path(os.environ.get("SENTINEL_HOME", Path(__file__).resolve().parent))
 CONFIG_PATH = BASE_DIR / "config.json"
 
 load_dotenv(BASE_DIR / ".env")
