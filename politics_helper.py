@@ -106,6 +106,7 @@ class Helper(discord.Client):
         self._reminder_msgs: list = []  # live reminder messages to clear on bump
         # TempVoice-style room control (panel, ..commands, saved prefs)
         self.rooms = vc_rooms.RoomManager(self, config, BASE_DIR)
+        self.rooms.delete_cb = self._delete_temp
         # ordered low -> high; gaining a higher rung removes all lower ones
         self.ladder: list[int] = [int(r) for r in config.get("LADDER", [])]
         self._spawning: set[int] = set()  # members mid-room-creation (debounce)

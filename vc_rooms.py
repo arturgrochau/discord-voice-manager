@@ -67,6 +67,8 @@ class RoomManager:
         self.prefs: dict = self._load(self.prefs_path)
         self.rooms: dict = self._load(self.rooms_path)   # cid(str) -> state
         self._ban_task = None
+        # set by the helper: coroutine that deletes a temp VC cleanly
+        self.delete_cb = None
 
     # -- persistence -------------------------------------------------------
 
@@ -111,7 +113,7 @@ class RoomManager:
         """Register a fresh room, re-apply the owner's saved prefs, post panel."""
         p = self.prefs.get(str(owner.id), {})
         state = {"owner": owner.id, "mods": [], "bans": {}, "hushed": [],
-                 "locked": False, "voice_default": True}
+                 "locked": False, "voice_default": True, "created": time.time()}
         self.rooms[str(vc.id)] = state
         self._save()
 
@@ -464,6 +466,17 @@ class RoomManager:
             await asyncio.sleep(60)
             try:
                 now = time.time()
+                # sweep rooms that emptied while the bot wasn't looking
+                # (e.g. someone left during a restart) — nothing may linger
+                for cid in list(self.rooms):
+                    vc = self.client.get_channel(int(cid))
+                    if vc is None:
+                        self.forget_room(int(cid))
+                        continue
+                    age = now - self.rooms[cid].get("created", 0)
+                    if age > 90 and not vc.members and self.delete_cb:
+                        log.info("Sweeper: deleting orphaned empty room %r", vc.name)
+                        await self.delete_cb(vc)
                 for cid, state in list(self.rooms.items()):
                     vc = self.client.get_channel(int(cid))
                     expired = [uid for uid, exp in state.get("bans", {}).items()
