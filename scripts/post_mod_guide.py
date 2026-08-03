@@ -37,7 +37,7 @@ SERVERS = {
         "token_file": Path.home() / "Projects/hk-sentinel/.env",
         "bot": "HUMANKIND BOT",
         "ping": "@★ / @☆",
-        "modmail_log": "#action-log",
+        "modmail_log": "#modmail-log",
         "bans_log": "#🔨〡bans",
         "detains_log": "#👮〡detains",
         "ladder": ("Neolithic 1 · Ancient Era 5 · Classical Era 10 · Medieval Era 18 · "
@@ -135,8 +135,16 @@ def build_embeds(s: dict) -> list[dict]:
     )
     xp = (
         "Nadeko (prefix `;`) awards **4 XP per message** (60 s cooldown) and "
-        "**4 XP/min in voice**. Rank roles are granted automatically and each "
-        "promotion **replaces** the previous rank role.\n\n"
+        "**12 XP/min in voice** — voice levels you ~3× faster by design. Rank "
+        "roles are granted automatically and each promotion **replaces** the "
+        "previous rank role.\n\n"
+        "**Promotions also take time**: each rank has a minimum tenure at the "
+        "previous rank (1 d for the second rung, scaling to 30 d at the top). "
+        "Reach the XP early and the promotion is deferred — the member is DMed "
+        "and the role lands automatically the moment tenure is served.\n\n"
+        "`.level` (`.lvl`, `.next`) — anyone can check their level, total XP, "
+        "next rank, XP to go (with voice/text time estimates), and any tenure "
+        "countdown.\n\n"
         f"**Ladder (role · level):** {s['ladder']}\n\n"
         "`;xp` — your card · `;xplb` — leaderboard · `;xprr` — role rewards\n"
         "`;xpadd @user N` — grant XP *(admin)*"
