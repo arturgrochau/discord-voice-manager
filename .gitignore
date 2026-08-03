@@ -6,3 +6,5 @@ sentinel.db
 __pycache__/
 *.pyc
 .DS_Store
+digest_history.json
+pulse_state.json

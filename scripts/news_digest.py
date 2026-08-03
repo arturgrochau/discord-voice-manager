@@ -10,10 +10,18 @@ article link when no good X post exists).
     🛡〡europe-news    — EU/national politics, sovereignty, migration, security
     🚀〡econ-tech      — European economy, energy, industry, tech & AI policy
 
-Run manually:  .venv/bin/python scripts/news_digest.py
-Scheduled by:  ~/Library/LaunchAgents/com.arturgrochau.pnp-news.plist (daily)
+Two modes:
+  full digest (default) — the original 3+4+3 daily roundup
+  --pulse             — rolling 15-minute breaking-news check: up to 2 fresh
+                        stories per section, expected to post NOTHING most
+                        runs; rate-limited so the channels never flood.
+
+Run manually:  .venv/bin/python scripts/news_digest.py [--pulse]
+Scheduled by:  com.arturgrochau.pnp-news system daemon on the M1
+               (StartInterval 900 → --pulse every 15 minutes)
 """
 
+import argparse
 import json
 import logging
 import logging.handlers
@@ -24,7 +32,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -94,6 +102,42 @@ sovereignty and migration stories when they posted about today's news.
 
 {skip_note}"""
 
+PULSE_RESEARCH_PROMPT = """It is {date}, {time} UTC. You are the rolling news
+desk for a European politics discussion server (audience: European
+sovereignty, EU/national politics, migration and borders, security/defence,
+energy independence, Europe's economy and tech standing).
+
+This check runs every 15 minutes, so ONLY report what is genuinely NEW:
+stories that broke or had a major development within roughly the LAST THREE
+HOURS. Run several live web and X searches now (news sites plus
+`site:x.com <keywords>` queries) to find them — do not answer from memory.
+
+Write a short markdown list of AT MOST:
+- 2 WORLD EVENTS stories (global geopolitics affecting Europe's position)
+- 2 EUROPE NEWS stories (EU/national politics, migration, security)
+- 2 ECON & TECH stories (European economy, energy, industry, tech/AI policy)
+
+The bar is HIGH: breaking, significant, and fresh. It is completely fine —
+and expected on most runs — to report NOTHING for a section, or nothing at
+all. Say "no new stories" rather than padding with ongoing coverage that has
+no new development.
+
+For each story: a short factual headline, then every URL you actually saw in
+your search results — X status URLs (x.com/<account>/status/<id>) and article
+URLs. Copy URLs character-for-character from results; NEVER write a URL you
+did not see. If no X post turned up, say so.
+
+X post quality bar (strict): ENGLISH-language posts only, from major
+high-follower news/commentary accounts such as: elonmusk, Reuters, AFP,
+SkyNews, BBCWorld, BBCBreaking, FT, Bloomberg, WSJ, POLITICOEurope,
+euronews, DWNews, visegrad24, MarioNawfal, RadioGenoa, disclosetv,
+spectatorindex, GlobeEyeNews, AFpost. @elonmusk is a priority source —
+check site:x.com/elonmusk for relevant recent posts, and prefer the takes
+of major European sovereignty-minded figures (Farage, Weidel, Salvini,
+Abascal, Orbán, Wilders, Meloni) when they posted about a breaking story.
+
+{skip_note}"""
+
 STRUCTURE_PROMPT = """Convert the following researched news list into JSON.
 Sections: world_events (3 stories), europe_news (4), econ_tech (3).
 For each story: title; x_url = an X status URL present in the text verbatim
@@ -103,8 +147,39 @@ them.
 
 {research}"""
 
+PULSE_STRUCTURE_PROMPT = """Convert the following researched news list into
+JSON. Sections: world_events, europe_news, econ_tech — each 0 to 2 stories,
+ONLY stories actually present in the text. If the text reports no new
+stories for a section, return an empty array for it — never invent stories.
+For each story: title; x_url = an X status URL present in the text verbatim
+(or "" if that story has none); article_url = an article URL present in the
+text verbatim (or "" if none). Copy URLs exactly — do not invent or repair
+them.
+
+{research}"""
+
 log = logging.getLogger("news-digest")
 HISTORY_PATH = BASE_DIR / "digest_history.json"
+PULSE_STATE_PATH = BASE_DIR / "pulse_state.json"
+
+# pulse flood guards: at most this many posts across all sections per hour,
+# and per section per single pulse
+PULSE_HOURLY_CAP = 6
+PULSE_SECTION_CAP = 2
+
+
+def pulse_recent_posts() -> list[float]:
+    try:
+        stamps = json.loads(PULSE_STATE_PATH.read_text())
+    except Exception:
+        stamps = []
+    cutoff = time.time() - 6 * 3600
+    return [t for t in stamps if t > cutoff]
+
+
+def pulse_record_posts(n: int) -> None:
+    stamps = pulse_recent_posts() + [time.time()] * n
+    PULSE_STATE_PATH.write_text(json.dumps(stamps))
 
 
 def load_history() -> list[str]:
@@ -220,6 +295,29 @@ def gather(max_attempts: int = 3) -> dict:
             log.warning("Attempt %d failed: %s", attempt, e)
         time.sleep(30)
     raise RuntimeError("Grok digest failed after retries")
+
+
+def gather_pulse() -> dict:
+    """One breaking-news sweep; empty results are normal, not an error."""
+    recent = load_history()
+    skip_note = ""
+    if recent:
+        skip_note = ("Already covered (do NOT reuse these URLs or re-report the "
+                     "same stories without a genuinely new development): "
+                     + " ".join(recent[-60:]))
+    now = datetime.now(timezone.utc)
+    research_raw = run_grok(
+        PULSE_RESEARCH_PROMPT.format(date=now.strftime("%A, %d %B %Y"),
+                                     time=now.strftime("%H:%M"),
+                                     skip_note=skip_note)
+    )
+    research = extract_text_field(research_raw)
+    log.info("Pulse research returned %d chars", len(research))
+    if len(research) < 40 or "no new stories" in research.lower()[:200]:
+        return {k: [] for k in CHANNELS}
+    data = parse_grok_output(run_grok(PULSE_STRUCTURE_PROMPT.format(research=research), SCHEMA))
+    validated = validate_stories(data)
+    return {k: v[:PULSE_SECTION_CAP] for k, v in validated.items()}
 
 
 def validate_stories(data: dict) -> dict:
@@ -348,8 +446,33 @@ def post_section(section: str, stories: list[dict], token: str) -> int:
 
 
 def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pulse", action="store_true",
+                    help="rolling breaking-news check (empty result = success)")
+    args = ap.parse_args()
     setup_logging()
     token = politics_bot_token()
+
+    if args.pulse:
+        recent = pulse_recent_posts()
+        last_hour = [t for t in recent if t > time.time() - 3600]
+        if len(last_hour) >= PULSE_HOURLY_CAP:
+            log.info("Pulse skipped: hourly cap reached (%d posts)", len(last_hour))
+            return
+        try:
+            data = gather_pulse()
+        except Exception:
+            log.exception("Pulse gather failed; next run in 15 min")
+            return
+        total = sum(post_section(section, data[section], token)
+                    for section in CHANNELS if data.get(section))
+        if total:
+            posted_urls = [s["content"].split("\n")[-1] for sec in data.values() for s in sec]
+            save_history(load_history() + posted_urls)
+            pulse_record_posts(total)
+        log.info("Pulse complete: %d new stories.", total)
+        return
+
     data = gather()
     total = sum(post_section(section, data[section], token) for section in CHANNELS)
     posted_urls = [s["content"].split("\n")[-1] for sec in data.values() for s in sec]
