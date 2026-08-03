@@ -26,6 +26,39 @@ def mod_embed(title: str, description: str, color: int, user_id: int | None = No
     return embed
 
 
+# -- staff tiers -----------------------------------------------------------
+# Two-tier staff model driven by config role ids, so moderators need NO
+# dangerous Discord permissions — the bot acts with its own permissions and
+# every action is logged. ADMIN_ROLE_IDS (or the Discord administrator
+# permission) unlocks everything; MOD_ROLE_IDS unlocks the day-to-day tools
+# (warn/detain/timeout/limited prune) but not bans, kicks or channel controls.
+
+def _role_ids(bot, key: str) -> set[int]:
+    return {int(r) for r in bot.config.get(key, [])}
+
+
+def is_staff(bot, member: discord.Member, *, admin_only: bool = False) -> bool:
+    if not isinstance(member, discord.Member):
+        return False
+    if member.guild_permissions.administrator or member.guild.owner_id == member.id:
+        return True
+    held = {r.id for r in member.roles}
+    if held & _role_ids(bot, "ADMIN_ROLE_IDS"):
+        return True
+    return not admin_only and bool(held & _role_ids(bot, "MOD_ROLE_IDS"))
+
+
+def staff_command(*, admin_only: bool = False):
+    """Gate a hybrid command to the staff tiers (works for prefix and slash)."""
+
+    async def predicate(ctx: commands.Context) -> bool:
+        if is_staff(ctx.bot, ctx.author, admin_only=admin_only):
+            return True
+        raise commands.MissingPermissions(["staff"])
+
+    return commands.check(predicate)
+
+
 class Moderation(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -64,13 +97,25 @@ class Moderation(commands.Cog):
         except discord.HTTPException:
             pass
 
-    @staticmethod
-    def check_hierarchy(actor: discord.Member, target: discord.Member) -> str | None:
+    def prune_cap(self, actor: discord.Member) -> int:
+        """Admins may prune up to 100; moderators are capped (anti mass-delete)."""
+        if is_staff(self.bot, actor, admin_only=True):
+            return 100
+        return int(self.bot.config.get("MOD_PRUNE_LIMIT", 15))
+
+    def check_hierarchy(self, actor: discord.Member, target: discord.Member) -> str | None:
         if target == actor:
             return "You can't moderate yourself."
         if target.guild.owner_id == target.id:
             return "You can't moderate the server owner."
-        if actor.guild.owner_id != actor.id and target.top_role >= actor.top_role:
+        # staff shield: admins are untouchable except by the owner, and staff
+        # can only be moderated by the admin tier (role positions don't matter)
+        if is_staff(self.bot, target, admin_only=True) and actor.guild.owner_id != actor.id:
+            return "Only the server owner can moderate an admin."
+        if is_staff(self.bot, target) and not is_staff(self.bot, actor, admin_only=True):
+            return "Moderators can't moderate other staff."
+        if actor.guild.owner_id != actor.id and not is_staff(self.bot, actor, admin_only=True) \
+                and target.top_role >= actor.top_role:
             return "You can't moderate someone with an equal or higher role."
         me = target.guild.me
         if target.top_role >= me.top_role:
@@ -82,7 +127,7 @@ class Moderation(commands.Cog):
     @commands.hybrid_command(name="detain", aliases=["d"], description="Detain a member: restrict them to the detainment channels.")
     @app_commands.describe(member="Member to detain", reason="Why they are being detained")
     @app_commands.default_permissions(manage_roles=True)
-    @commands.has_permissions(manage_roles=True)
+    @staff_command()
     async def detain(self, ctx: commands.Context, member: discord.Member, *, reason: str | None = None):
         role = self.detain_role(ctx.guild)
         if not role:
@@ -112,7 +157,7 @@ class Moderation(commands.Cog):
     @commands.hybrid_command(name="undetain", aliases=["ud"], description="Release a detained member.")
     @app_commands.describe(member="Member to release", reason="Why they are being released")
     @app_commands.default_permissions(manage_roles=True)
-    @commands.has_permissions(manage_roles=True)
+    @staff_command()
     async def undetain(self, ctx: commands.Context, member: discord.Member, *, reason: str | None = None):
         role = self.detain_role(ctx.guild)
         if not role:
@@ -184,7 +229,7 @@ class Moderation(commands.Cog):
     @commands.hybrid_command(name="ban", aliases=["b"], description="Ban a member.")
     @app_commands.describe(member="Member to ban", reason="Reason")
     @app_commands.default_permissions(ban_members=True)
-    @commands.has_permissions(ban_members=True)
+    @staff_command(admin_only=True)
     async def ban(self, ctx: commands.Context, member: discord.Member, *, reason: str | None = None):
         err = self.check_hierarchy(ctx.author, member)
         if err:
@@ -199,7 +244,7 @@ class Moderation(commands.Cog):
     @commands.hybrid_command(name="unban", aliases=["ub"], description="Unban a user by ID or name.")
     @app_commands.describe(user="User ID or username", reason="Reason")
     @app_commands.default_permissions(ban_members=True)
-    @commands.has_permissions(ban_members=True)
+    @staff_command(admin_only=True)
     async def unban(self, ctx: commands.Context, user: str, *, reason: str | None = None):
         target = None
         if user.isdigit():
@@ -223,7 +268,7 @@ class Moderation(commands.Cog):
     @commands.hybrid_command(name="kick", aliases=["k"], description="Kick a member from the server.")
     @app_commands.describe(member="Member to kick", reason="Reason")
     @app_commands.default_permissions(kick_members=True)
-    @commands.has_permissions(kick_members=True)
+    @staff_command(admin_only=True)
     async def kick(self, ctx: commands.Context, member: discord.Member, *, reason: str | None = None):
         err = self.check_hierarchy(ctx.author, member)
         if err:
@@ -240,7 +285,7 @@ class Moderation(commands.Cog):
     @commands.hybrid_command(name="timeout", aliases=["t"], description="Time a member out (minutes, max 28 days).")
     @app_commands.describe(member="Member", minutes="Duration in minutes (max 40320)", reason="Reason")
     @app_commands.default_permissions(moderate_members=True)
-    @commands.has_permissions(moderate_members=True)
+    @staff_command()
     async def timeout(self, ctx: commands.Context, member: discord.Member, minutes: commands.Range[int, 1, 40320], *, reason: str | None = None):
         err = self.check_hierarchy(ctx.author, member)
         if err:
@@ -255,7 +300,7 @@ class Moderation(commands.Cog):
 
     @commands.hybrid_command(name="untimeout", aliases=["ut"], description="Remove a member's timeout.")
     @app_commands.default_permissions(moderate_members=True)
-    @commands.has_permissions(moderate_members=True)
+    @staff_command()
     async def untimeout(self, ctx: commands.Context, member: discord.Member, *, reason: str | None = None):
         await member.timeout(None, reason=f"{ctx.author}: {reason or 'no reason'}")
         await ctx.reply(f"✅ Timeout removed for {member.mention}.")
@@ -268,8 +313,11 @@ class Moderation(commands.Cog):
     @commands.hybrid_command(name="warn", aliases=["w"], description="Warn a member (recorded permanently).")
     @app_commands.describe(member="Member to warn", reason="Reason")
     @app_commands.default_permissions(moderate_members=True)
-    @commands.has_permissions(moderate_members=True)
+    @staff_command()
     async def warn(self, ctx: commands.Context, member: discord.Member, *, reason: str):
+        err = self.check_hierarchy(ctx.author, member)
+        if err:
+            return await ctx.reply(f"⛔ {err}")
         warning_id = await self.bot.db.add_warning(ctx.guild.id, member.id, ctx.author.id, reason)
         count = len(await self.bot.db.warnings_for(ctx.guild.id, member.id))
         # unlike other command replies this one stays in the channel: the
@@ -285,7 +333,7 @@ class Moderation(commands.Cog):
 
     @commands.hybrid_command(name="warnings", aliases=["ws"], description="List a member's warnings.")
     @app_commands.default_permissions(moderate_members=True)
-    @commands.has_permissions(moderate_members=True)
+    @staff_command()
     async def warnings(self, ctx: commands.Context, member: discord.Member):
         rows = await self.bot.db.warnings_for(ctx.guild.id, member.id)
         if not rows:
@@ -296,7 +344,7 @@ class Moderation(commands.Cog):
 
     @commands.hybrid_command(name="clearwarnings", aliases=["cw"], description="Clear all warnings for a member.")
     @app_commands.default_permissions(administrator=True)
-    @commands.has_permissions(administrator=True)
+    @staff_command(admin_only=True)
     async def clearwarnings(self, ctx: commands.Context, member: discord.Member):
         n = await self.bot.db.clear_warnings(ctx.guild.id, member.id)
         await ctx.reply(f"🧹 Cleared {n} warning(s) for {member.mention}.")
@@ -319,12 +367,16 @@ class Moderation(commands.Cog):
     @app_commands.describe(amount="How many messages", member="Only delete this member's messages")
     @app_commands.default_permissions(manage_messages=True)
     async def purge_slash(self, interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100], member: discord.Member | None = None):
+        cap = self.prune_cap(interaction.user)
+        if amount > cap:
+            return await interaction.response.send_message(
+                f"⛔ Moderators can prune at most **{cap}** messages at a time.", ephemeral=True)
         await interaction.response.defer(ephemeral=True)
         n = await self._do_purge(interaction, interaction.channel, interaction.user, amount, member)
         await interaction.followup.send(f"🧹 Deleted {n} message(s).", ephemeral=True)
 
     @commands.command(name="purge", aliases=["prune", "p"])
-    @commands.has_permissions(manage_messages=True)
+    @staff_command()
     async def purge_prefix(self, ctx: commands.Context,
                            first: discord.Member | int,
                            second: discord.Member | int | None = None):
@@ -333,6 +385,9 @@ class Moderation(commands.Cog):
         member = next((a for a in (first, second) if isinstance(a, discord.Member)), None)
         if amount is None:
             return await ctx.reply("Usage: `.prune N` or `.prune @user N`")
+        cap = self.prune_cap(ctx.author)
+        if amount > cap:
+            return await ctx.reply(f"⛔ Moderators can prune at most **{cap}** messages at a time.")
         amount = max(1, min(100, amount))
         try:
             await ctx.message.delete()

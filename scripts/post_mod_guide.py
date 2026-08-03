@@ -29,12 +29,14 @@ SERVERS = {
                    "Erudite 30 · Sovereign 45 · Imperator 65 · Supreme 90 · "
                    "Leviathan 120 · Mythical 150"),
         "extras": True,
+        "admin_role": "@Admin",
+        "mod_role": "@Mod",
     },
     "hk": {
         "channel": "1533867021761122584",   # 📖〡mod-guide (admin)
         "token_file": Path.home() / "Projects/hk-sentinel/.env",
         "bot": "HUMANKIND BOT",
-        "ping": "@★",
+        "ping": "@★ / @☆",
         "modmail_log": "#action-log",
         "bans_log": "#🔨〡bans",
         "detains_log": "#👮〡detains",
@@ -42,6 +44,8 @@ SERVERS = {
                    "Early Modern Era 30 · Industrial Era 45 · Contemporary Era 65 · "
                    "Era Star 90 · Fame Legend 120 · Endless 150"),
         "extras": False,
+        "admin_role": "★ (filled star)",
+        "mod_role": "☆ (empty star)",
     },
 }
 
@@ -64,6 +68,25 @@ def api(token: str, method: str, path: str, body=None):
 
 
 def build_embeds(s: dict) -> list[dict]:
+    tiers = (
+        f"Staff power is **role-based and enforced by the bot** — moderators need "
+        f"no dangerous Discord permissions; the bot acts on their behalf, applies "
+        f"the limits below, and logs every action.\n\n"
+        f"**{s['admin_role']} — Admin tier**\n"
+        f"Everything: ban/unban/kick, clearwarnings, lock/unlock/slowmode, "
+        f"prune up to 100 — plus all moderator tools.\n\n"
+        f"**{s['mod_role']} — Moderator tier**\n"
+        f"Day-to-day tools: `.warn` · `.detain`/`.undetain` · `.timeout`/"
+        f"`.untimeout` · `.warnings` · prune (**max 15 per command**, anti "
+        f"mass-delete) · modmail (view, reply, `=close`).\n"
+        f"❌ No bans, kicks, channel locks or warning wipes.\n\n"
+        f"**Protections**\n"
+        f"• Staff can't be moderated by moderators; admins only by the owner.\n"
+        f"• Warn/detain/ban all run the same hierarchy check.\n"
+        f"• Prefix shortcuts work for whichever tier owns the command; slash "
+        f"commands may stay hidden for mods (Discord UI) — the `.` commands are "
+        f"the moderator interface."
+    )
     mod = (
         "All moderation lives in the sentinel — prefix `.` (shortcuts in parentheses); "
         "everything except prune is also a `/` slash command. "
@@ -73,7 +96,7 @@ def build_embeds(s: dict) -> list[dict]:
         f"DMs the user, logged publicly in {s['detains_log']}\n"
         "`.undetain (.ud) @user [reason]` — release\n"
         "`/detainhistory @user` — full detention record *(slash only)*\n\n"
-        "**🔨 Removal** — all logged publicly in " + s["bans_log"] + "\n"
+        "**🔨 Removal** *(admin tier)* — all logged publicly in " + s["bans_log"] + "\n"
         "`.ban (.b) @user [reason]` · `.kick (.k) @user [reason]`\n"
         "`.unban (.ub) <id or name>`\n\n"
         "**⏳ Timeouts**\n"
@@ -83,11 +106,13 @@ def build_embeds(s: dict) -> list[dict]:
         "`.warn (.w) @user <reason>` — the bot's warning message **stays in the "
         "channel** for transparency (your command still auto-deletes); user is DMed\n"
         "`.warnings (.ws) @user` — list a member's warnings (private reply)\n"
-        "`.clearwarnings (.cw) @user` — wipe them *(admin only)*\n\n"
+        "`.clearwarnings (.cw) @user` — wipe them *(admin tier)*\n\n"
         "**🧹 Cleanup**\n"
-        "`.prune (.purge, .p) N` — delete the last N messages (max 100)\n"
+        "`.prune (.purge, .p) N` — delete the last N messages "
+        "(admins max 100, **mods max 15**)\n"
         "`.prune @user N` *or* `.prune N @user` — only that user's messages\n"
-        "`/slowmode <seconds>` · `/lock` · `/unlock` — channel controls *(slash only)*\n\n"
+        "`/slowmode <seconds>` · `/lock` · `/unlock` — channel controls "
+        "*(slash only, admin tier)*\n\n"
         "**🔊 Voice**\n"
         "`/stickymute @user [reason]` — keep server-muted across rejoins · `/unstickymute`\n"
         "Stale server-mutes are auto-lifted (detained & sticky-muted users are skipped).\n\n"
@@ -133,6 +158,7 @@ def build_embeds(s: dict) -> list[dict]:
     )
     return [
         {"title": f"🛡️ {s['bot']} — Staff Command Guide", "description": mod, "color": 0x3498DB},
+        {"title": "👥 Staff Tiers", "description": tiers, "color": 0xE67E22},
         {"title": "📬 Modmail", "description": modmail, "color": 0x9B59B6},
         {"title": "🎖️ XP & Ranks", "description": xp, "color": 0xF1C40F},
         {"title": "🤖 Automations", "description": autom, "color": 0x2ECC71},
