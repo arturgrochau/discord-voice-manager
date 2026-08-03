@@ -144,6 +144,9 @@ class Helper(discord.Client):
         if self.ladder and self.config.get("LADDER_MIN_RANK_DAYS"):
             self.loop.create_task(self._pending_promotions_loop())
         await self.rooms.start()
+        # every live room is delete-tracked, whatever it was renamed to
+        for cid in self.rooms.rooms:
+            self.temp_vcs.setdefault(int(cid), time.monotonic())
 
         # rebuild the open-ticket map from channel topics (restart-safe)
         if self.modmail_category_id:
@@ -677,17 +680,7 @@ class Helper(discord.Client):
             category = guild.get_channel(self.category_id)
             name = f"{TEMP_VC_PREFIX}{member.display_name}'s room"[:100]
             overwrites = {
-                member: discord.PermissionOverwrite(
-                    view_channel=True,
-                    connect=True,
-                    speak=True,
-                    manage_channels=True,
-                    mute_members=True,
-                    deafen_members=True,
-                    move_members=True,
-                    priority_speaker=True,
-                    set_voice_channel_status=True,
-                )
+                member: vc_rooms._owner_overwrite()
             }
             try:
                 vc = await guild.create_voice_channel(

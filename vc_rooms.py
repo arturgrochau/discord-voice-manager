@@ -35,7 +35,7 @@ log = logging.getLogger("politics-helper.rooms")
 BAN_DENY = discord.PermissionOverwrite(view_channel=False, connect=False)
 HUSH_DENY_KEY = "send_messages"
 MOD_ALLOW = discord.PermissionOverwrite(
-    connect=True, mute_members=True, deafen_members=True, move_members=True)
+    connect=True, mute_members=True, deafen_members=True)
 
 RANDOM_NAMES = [
     "🎧 late night lounge", "🏛️ the forum", "🔥 fireside", "🌌 star chamber",
@@ -45,9 +45,12 @@ RANDOM_NAMES = [
 
 
 def _owner_overwrite() -> discord.PermissionOverwrite:
+    # NOTE: no move_members — Discord validates it against the destination
+    # channel, so granting it on the owner's room would let them pull anyone
+    # in from other channels. Kicking is bot-mediated (..kick / Kick button).
     return discord.PermissionOverwrite(
         view_channel=True, connect=True, speak=True, manage_channels=True,
-        mute_members=True, deafen_members=True, move_members=True,
+        mute_members=True, deafen_members=True,
         priority_speaker=True, set_voice_channel_status=True,
     )
 
@@ -97,13 +100,23 @@ class RoomManager:
     # -- lifecycle ---------------------------------------------------------
 
     async def start(self) -> None:
-        """Re-arm persistent views and drop state for rooms that vanished."""
+        """Re-arm persistent views, drop vanished rooms, purge empty ones.
+
+        Rooms are tracked by id in vc_rooms.json (never by name), so renamed
+        rooms survive restarts with full tracking — and any room that emptied
+        while the bot was down is deleted right here, not a minute later.
+        """
         gone = [cid for cid in list(self.rooms)
                 if self.client.get_channel(int(cid)) is None]
         for cid in gone:
             self.rooms.pop(cid, None)
         if gone:
             self._save()
+        for cid in list(self.rooms):
+            vc = self.client.get_channel(int(cid))
+            if vc is not None and not vc.members and self.delete_cb:
+                log.info("Startup: deleting room %r left empty while offline", vc.name)
+                await self.delete_cb(vc)
         self.client.add_view(RoomPanel(self))
         if self._ban_task is None:
             self._ban_task = self.client.loop.create_task(self._timed_ban_loop())
@@ -418,6 +431,26 @@ class RoomManager:
         return (f"🤫 {member.mention} can no longer type in this chat."
                 if on else f"💬 {member.mention} can type again.")
 
+    async def act_kick(self, vc, actor, member: discord.Member) -> str:
+        state = self.room(vc.id)
+        if not self.is_staff(vc.id, actor.id):
+            return "⛔ Only the owner or room mods can kick."
+        if member.id == state["owner"]:
+            return "⛔ You can't kick the room owner."
+        if member.guild_permissions.administrator:
+            return "⛔ You can't kick a server admin."
+        if not (member.voice and member.voice.channel and member.voice.channel.id == vc.id):
+            return "⛔ They're not in this room."
+        try:
+            await member.move_to(None, reason=f"Room kick by {actor}")
+        except discord.HTTPException:
+            return "⚠️ Kick failed — try again."
+        await self._log(vc, f"{member.mention} was **kicked** by {actor.mention}.")
+        await self._dm(member, f"👢 You were kicked from the voice room **{vc.name}** "
+                               f"by **{actor.display_name}** ({vc.guild.name}). "
+                               "You can rejoin unless you get banned.")
+        return f"👢 {member.mention} kicked from the room."
+
     async def act_claim(self, vc, actor) -> str:
         state = self.room(vc.id)
         owner = vc.guild.get_member(state["owner"])
@@ -533,6 +566,8 @@ class RoomManager:
                 out = await need_member(self.act_ban, minutes)
             elif cmd == "unban":
                 out = await need_member(self.act_unban)
+            elif cmd == "kick":
+                out = await need_member(self.act_kick)
             elif cmd in ("bans", "displaybans", "display_bans"):
                 out = self.bans_text(vc)
             elif cmd == "mod":
@@ -584,6 +619,7 @@ class _MemberAction(discord.ui.View):
         fn = {
             "ban": lambda: self.mgr.act_ban(self.vc, interaction.user, member, self.minutes),
             "unban": lambda: self.mgr.act_unban(self.vc, interaction.user, member),
+            "kick": lambda: self.mgr.act_kick(self.vc, interaction.user, member),
             "mod": lambda: self.mgr.act_mod(self.vc, interaction.user, member, True),
             "demod": lambda: self.mgr.act_mod(self.vc, interaction.user, member, False),
             "hush": lambda: self.mgr.act_hush(self.vc, interaction.user, member, True),
@@ -591,7 +627,7 @@ class _MemberAction(discord.ui.View):
         }[self.action]
         out = await fn()
         await interaction.response.edit_message(content=out, view=None)
-        if out.startswith(("🔨", "♻️", "🛡️", "👑", "🤫")):
+        if out.startswith(("🔨", "♻️", "🛡️", "👑", "🤫", "👢")):
             try:
                 await self.vc.send(out)
             except discord.HTTPException:
@@ -625,15 +661,34 @@ class RoomPanel(discord.ui.View):
     def __init__(self, mgr: RoomManager):
         super().__init__(timeout=None)
         self.mgr = mgr
+        # third slot of the access row: Minors where configured, Random elsewhere
         if mgr.minor_role_id:
             btn = discord.ui.Button(label="Minors", emoji="🔞",
                                     style=discord.ButtonStyle.secondary,
-                                    custom_id="vcr:minors", row=3)
-            async def _minors(interaction: discord.Interaction):
+                                    custom_id="vcr:minors", row=1)
+            async def _cb(interaction: discord.Interaction):
                 if (vc := await self._guard(interaction)):
                     await self._reply(interaction, await self.mgr.act_nominors(vc, interaction.user), announce=True)
-            btn.callback = _minors
-            self.add_item(btn)
+        else:
+            btn = discord.ui.Button(label="Random", emoji="🎲",
+                                    style=discord.ButtonStyle.secondary,
+                                    custom_id="vcr:random", row=1)
+            async def _cb(interaction: discord.Interaction):
+                if (vc := await self._guard(interaction)):
+                    await self._reply(interaction, await self.mgr.act_random(vc, interaction.user))
+        btn.callback = _cb
+        self.add_item(btn)
+
+        kick = discord.ui.Button(label="Kick", emoji="👢",
+                                 style=discord.ButtonStyle.secondary,
+                                 custom_id="vcr:kick", row=2)
+        async def _kick(interaction: discord.Interaction):
+            if (vc := await self._guard(interaction)):
+                await interaction.response.send_message(
+                    "Who gets kicked from the room? (they can rejoin unless banned)",
+                    view=_MemberAction(self.mgr, vc, "kick"), ephemeral=True)
+        kick.callback = _kick
+        self.add_item(kick)
 
     async def _guard(self, interaction: discord.Interaction) -> discord.VoiceChannel | None:
         vc = interaction.channel
@@ -700,7 +755,7 @@ class RoomPanel(discord.ui.View):
                 "Who do you want to unban?", view=_MemberAction(self.mgr, vc, "unban"), ephemeral=True)
 
     @discord.ui.button(label="Bans", emoji="📋", style=discord.ButtonStyle.secondary,
-                       custom_id="vcr:bans", row=2)
+                       custom_id="vcr:bans", row=3)
     async def b_bans(self, interaction, _):
         if (vc := await self._guard(interaction)):
             await interaction.response.send_message(self.mgr.bans_text(vc), ephemeral=True)
@@ -721,20 +776,14 @@ class RoomPanel(discord.ui.View):
                 "Who gets hushed in this chat? (`..unhush @user` to undo)",
                 view=_MemberAction(self.mgr, vc, "hush"), ephemeral=True)
 
-    @discord.ui.button(label="Random", emoji="🎲", style=discord.ButtonStyle.secondary,
-                       custom_id="vcr:random", row=1)
-    async def b_random(self, interaction, _):
-        if (vc := await self._guard(interaction)):
-            await self._reply(interaction, await self.mgr.act_random(vc, interaction.user))
-
     @discord.ui.button(label="Claim", emoji="👑", style=discord.ButtonStyle.success,
-                       custom_id="vcr:claim", row=3)
+                       custom_id="vcr:claim", row=4)
     async def b_claim(self, interaction, _):
         if (vc := await self._guard(interaction)):
             await self._reply(interaction, await self.mgr.act_claim(vc, interaction.user), announce=True)
 
     @discord.ui.button(label="Transfer", emoji="➡️", style=discord.ButtonStyle.secondary,
-                       custom_id="vcr:transfer", row=3)
+                       custom_id="vcr:transfer", row=4)
     async def b_transfer(self, interaction, _):
         if (vc := await self._guard(interaction)):
             await interaction.response.send_message(
@@ -742,7 +791,7 @@ class RoomPanel(discord.ui.View):
                 view=_MemberAction(self.mgr, vc, "transfer"), ephemeral=True)
 
     @discord.ui.button(label="Abandon", emoji="🏳️", style=discord.ButtonStyle.danger,
-                       custom_id="vcr:abandon", row=3)
+                       custom_id="vcr:abandon", row=4)
     async def b_abandon(self, interaction, _):
         if (vc := await self._guard(interaction)):
             await self._reply(interaction, await self.mgr.act_abandon(vc, interaction.user), announce=True)
