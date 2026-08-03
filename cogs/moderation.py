@@ -272,7 +272,12 @@ class Moderation(commands.Cog):
     async def warn(self, ctx: commands.Context, member: discord.Member, *, reason: str):
         warning_id = await self.bot.db.add_warning(ctx.guild.id, member.id, ctx.author.id, reason)
         count = len(await self.bot.db.warnings_for(ctx.guild.id, member.id))
-        await ctx.reply(f"⚠️ {member.mention} warned (warning #{count}).")
+        # unlike other command replies this one stays in the channel: the
+        # invocation is cleaned up but the warning itself remains visible
+        await ctx.send(
+            f"⚠️ {member.mention} — **warning #{count}**\n**Reason:** {reason}",
+            delete_after=None,
+        )
         await self.try_dm(member, f"You have been warned in **{ctx.guild.name}**.\nReason: {reason}\nTotal warnings: {count}")
         await self.send_log(mod_embed("⚠️ Member Warned",
                                       f"{member.mention} warned by {ctx.author.mention} (#{warning_id}, total {count}).\n**Reason:** {reason}",

@@ -14,6 +14,10 @@ Politics Bot with no third-party bots involved.
   channel and posts a reminder when the 2-hour cooldown expires. (Actually
   invoking /bump automatically would be user-account automation, which
   Discord ToS forbids — so the last click stays human.)
+- Modmail: DMing the bot opens a ticket channel in the modmail category;
+  everything the user DMs is relayed there, plain mod messages in the ticket
+  are relayed back to the user's DMs, and `=close [reason]` closes the ticket
+  (transcript goes to the log channel).
 
 Config: politics_helper.json next to this file.
 """
@@ -100,6 +104,12 @@ class Helper(discord.Client):
         # ordered low -> high; gaining a higher rung removes all lower ones
         self.ladder: list[int] = [int(r) for r in config.get("LADDER", [])]
         self._spawning: set[int] = set()  # members mid-room-creation (debounce)
+        # modmail
+        self.modmail_category_id = int(config.get("MODMAIL_CATEGORY_ID", 0) or 0)
+        self.modmail_ping_roles = [int(r) for r in config.get("MODMAIL_PING_ROLE_IDS", [])]
+        self.modmail_log_id = int(config.get("MODMAIL_LOG_CHANNEL_ID", 0) or 0)
+        self.tickets: dict[int, int] = {}       # user id -> ticket channel id
+        self.ticket_users: dict[int, int] = {}  # ticket channel id -> user id
 
     async def on_ready(self):
         log.info("Politics helper online as %s (%s)", self.user, self.user.id)
@@ -125,6 +135,17 @@ class Helper(discord.Client):
             self.loop.create_task(self._bump_bootstrap())
         if self.general_channel_id:
             self.loop.create_task(self._quote_loop())
+
+        # rebuild the open-ticket map from channel topics (restart-safe)
+        if self.modmail_category_id:
+            mm_cat = guild.get_channel(self.modmail_category_id)
+            for ch in (mm_cat.text_channels if mm_cat else []):
+                m = re.fullmatch(r"modmail:(\d+)", ch.topic or "")
+                if m:
+                    uid = int(m.group(1))
+                    self.tickets[uid] = ch.id
+                    self.ticket_users[ch.id] = uid
+            log.info("Modmail active: %d open ticket(s)", len(self.tickets))
 
     # -- bump reminder -----------------------------------------------------
 
@@ -211,6 +232,16 @@ class Helper(discord.Client):
     async def on_message(self, message: discord.Message):
         import asyncio
 
+        # modmail: DMs open/continue tickets, ticket channels relay back
+        if message.guild is None:
+            if self.modmail_category_id and not message.author.bot:
+                await self._modmail_inbound(message)
+            return
+        if message.channel.id in self.ticket_users:
+            if not message.author.bot:
+                await self._modmail_outbound(message)
+            return
+
         if message.channel.id != self.bump_channel_id or not self._is_bump_done(message):
             return
         await self._clear_reminders()
@@ -240,6 +271,173 @@ class Helper(discord.Client):
             await self._post_bump_reminder()
 
         self._bump_task = self.loop.create_task(remind_later())
+
+    # -- modmail -----------------------------------------------------------
+
+    MODMAIL_COLOR_IN = 0x3498DB   # user -> mods
+    MODMAIL_COLOR_OUT = 0x2ECC71  # mods -> user
+
+    @staticmethod
+    def _attachment_lines(message: discord.Message) -> str:
+        return "\n".join(f"📎 {a.url}" for a in message.attachments)
+
+    async def _modmail_inbound(self, message: discord.Message):
+        """A user DMed the bot: open (or continue) their ticket."""
+        guild = self.get_guild(self.guild_id)
+        category = guild.get_channel(self.modmail_category_id) if guild else None
+        if category is None:
+            return
+        channel = self.get_channel(self.tickets.get(message.author.id, 0))
+        opened = False
+        if channel is None:
+            member = guild.get_member(message.author.id)
+            try:
+                channel = await guild.create_text_channel(
+                    f"📬〡{message.author.name}"[:100],
+                    category=category,
+                    topic=f"modmail:{message.author.id}",
+                    overwrites=category.overwrites,
+                    reason=f"Modmail ticket opened by {message.author}",
+                )
+            except discord.HTTPException as e:
+                log.warning("Modmail ticket creation failed for %s: %s", message.author, e)
+                return
+            self.tickets[message.author.id] = channel.id
+            self.ticket_users[channel.id] = message.author.id
+            opened = True
+            header = discord.Embed(
+                title="📬 New modmail ticket",
+                description=(
+                    f"**User:** {message.author.mention} (`{message.author}`, id {message.author.id})\n"
+                    f"**Account created:** {discord.utils.format_dt(message.author.created_at, 'R')}\n"
+                    + (f"**Joined server:** {discord.utils.format_dt(member.joined_at, 'R')}\n"
+                       f"**Roles:** {', '.join(r.mention for r in member.roles[1:]) or '—'}"
+                       if member else "**Not currently a member of the server.**")
+                ),
+                color=self.MODMAIL_COLOR_IN,
+            )
+            header.set_footer(text="Reply with a plain message to answer • =close [reason] to close")
+            ping = " ".join(f"<@&{r}>" for r in self.modmail_ping_roles)
+            try:
+                await channel.send(ping or None, embed=header)
+            except discord.HTTPException:
+                pass
+            log.info("Modmail ticket opened for %s (#%s)", message.author, channel.name)
+
+        embed = discord.Embed(
+            description=(message.content or "").strip() or "*(no text)*",
+            color=self.MODMAIL_COLOR_IN,
+            timestamp=message.created_at,
+        )
+        embed.set_author(name=f"{message.author.display_name} (user)",
+                         icon_url=message.author.display_avatar.url)
+        if message.attachments:
+            embed.add_field(name="Attachments", value=self._attachment_lines(message)[:1024], inline=False)
+        try:
+            await channel.send(embed=embed)
+        except discord.HTTPException as e:
+            log.warning("Modmail relay to %s failed: %s", channel, e)
+            return
+        if opened:
+            await self._try_dm(
+                message.author,
+                f"📬 Thanks for reaching out! Your message has been delivered to the "
+                f"**{guild.name}** mod team. You'll get a reply right here — it can take "
+                f"up to 24 hours. Anything else you send me is added to the same ticket.",
+            )
+        else:
+            try:
+                await message.add_reaction("📨")
+            except discord.HTTPException:
+                pass
+
+    async def _modmail_outbound(self, message: discord.Message):
+        """A mod wrote in a ticket channel: relay to the user or run a command."""
+        uid = self.ticket_users.get(message.channel.id)
+        content = (message.content or "").strip()
+        if content.startswith("="):
+            cmd, _, arg = content[1:].partition(" ")
+            if cmd.lower() == "close":
+                await self._modmail_close(message, uid, arg.strip())
+            else:
+                await message.channel.send(
+                    "Commands here: `=close [reason]` — plain messages are sent to the user.",
+                    delete_after=15,
+                )
+            return
+        # other bots' command prefixes stay internal to the ticket
+        if content.startswith((".", ";", "/", "!")):
+            return
+        if not content and not message.attachments:
+            return
+        guild = message.guild
+        embed = discord.Embed(
+            description=content or "*(no text)*",
+            color=self.MODMAIL_COLOR_OUT,
+            timestamp=message.created_at,
+        )
+        embed.set_author(name=f"{message.author.display_name} — {guild.name} Mod Team",
+                         icon_url=message.author.display_avatar.url)
+        if message.attachments:
+            embed.add_field(name="Attachments", value=self._attachment_lines(message)[:1024], inline=False)
+        try:
+            user = self.get_user(uid) or await self.fetch_user(uid)
+            await user.send(embed=embed)
+            await message.add_reaction("✅")
+        except discord.HTTPException as e:
+            await message.channel.send(
+                f"⚠️ Couldn't deliver that — the user may have left or blocked DMs. ({e.status})",
+            )
+
+    async def _modmail_close(self, message: discord.Message, uid: int, reason: str):
+        channel = message.channel
+        # transcript for the log channel
+        lines = [f"Modmail transcript — #{channel.name} (user id {uid}), "
+                 f"closed by {message.author} ({reason or 'no reason given'})", ""]
+        try:
+            async for m in channel.history(limit=500, oldest_first=True):
+                stamp = m.created_at.strftime("%Y-%m-%d %H:%M")
+                if m.embeds and m.embeds[0].author.name:
+                    lines.append(f"[{stamp}] {m.embeds[0].author.name}: {m.embeds[0].description or ''}")
+                elif m.content:
+                    lines.append(f"[{stamp}] {m.author.display_name}: {m.content}")
+        except discord.HTTPException:
+            pass
+        log_channel = self.get_channel(self.modmail_log_id)
+        if log_channel:
+            import io
+            try:
+                await log_channel.send(
+                    f"📪 Modmail ticket for <@{uid}> closed by {message.author.mention}."
+                    + (f" Reason: {reason}" if reason else ""),
+                    file=discord.File(io.BytesIO("\n".join(lines).encode()),
+                                      filename=f"modmail-{uid}.txt"),
+                )
+            except discord.HTTPException:
+                log.warning("Modmail transcript post failed")
+        try:
+            user = self.get_user(uid) or await self.fetch_user(uid)
+            await user.send(
+                f"📪 Your ticket with the **{message.guild.name}** mod team has been closed."
+                + (f"\nNote from the team: {reason}" if reason else "")
+                + "\nIf you need anything else, just send me another message."
+            )
+        except discord.HTTPException:
+            pass
+        self.tickets.pop(uid, None)
+        self.ticket_users.pop(channel.id, None)
+        try:
+            await channel.delete(reason=f"Modmail closed by {message.author}")
+        except discord.HTTPException as e:
+            log.warning("Modmail channel delete failed: %s", e)
+        log.info("Modmail ticket for %s closed by %s", uid, message.author)
+
+    @staticmethod
+    async def _try_dm(user: discord.abc.User, text: str):
+        try:
+            await user.send(text)
+        except discord.HTTPException:
+            pass
 
     # -- philosophy quotes -------------------------------------------------
 
