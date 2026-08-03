@@ -154,8 +154,12 @@ def build_embeds(s: dict) -> list[dict]:
     )
     autom = (
         "**🔺 Join to Create** — joining the trigger voice channel spawns a personal "
-        "room; the creator can mute/deafen/move/rename inside it regardless of roles. "
-        "Empty rooms self-delete.\n"
+        "room with a **control panel** posted in its chat: buttons + `..commands` for "
+        "rename/status/size, lock, speaking default, room bans (timed or permanent), "
+        "room mods, hush, claim/transfer/abandon — plus native right-click "
+        "mute/deafen/move for the owner. Every owner's settings (name, size, lock, "
+        "bans, mods) are **saved and re-applied** on their next room. Empty rooms "
+        "self-delete.\n"
         + ("**📚 Reaction roles** — #rules-and-info: 📚 book club · 📰 news ping · "
            "🏛️ debate ping\n"
            "**🏛️ Philosophy quotes** — every ~4 h in general chat (skips dead hours)\n"

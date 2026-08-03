@@ -33,6 +33,9 @@ from pathlib import Path
 
 import discord
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import vc_rooms  # noqa: E402  (TempVoice-style room control panel)
+
 # HELPER_HOME lets other servers run their own instance off this codebase.
 BASE_DIR = Path(os.environ.get("HELPER_HOME", Path(__file__).resolve().parent))
 CONFIG_PATH = BASE_DIR / "politics_helper.json"
@@ -101,6 +104,8 @@ class Helper(discord.Client):
         self._bump_task = None
         self._last_reward_at = 0.0
         self._reminder_msgs: list = []  # live reminder messages to clear on bump
+        # TempVoice-style room control (panel, ..commands, saved prefs)
+        self.rooms = vc_rooms.RoomManager(self, config, BASE_DIR)
         # ordered low -> high; gaining a higher rung removes all lower ones
         self.ladder: list[int] = [int(r) for r in config.get("LADDER", [])]
         self._spawning: set[int] = set()  # members mid-room-creation (debounce)
@@ -137,6 +142,7 @@ class Helper(discord.Client):
             self.loop.create_task(self._quote_loop())
         if self.ladder and self.config.get("LADDER_MIN_RANK_DAYS"):
             self.loop.create_task(self._pending_promotions_loop())
+        await self.rooms.start()
 
         # rebuild the open-ticket map from channel topics (restart-safe)
         if self.modmail_category_id:
@@ -242,6 +248,10 @@ class Helper(discord.Client):
         if message.channel.id in self.ticket_users:
             if not message.author.bot:
                 await self._modmail_outbound(message)
+            return
+        # ..commands inside a temp room's chat
+        if str(message.channel.id) in self.rooms.rooms and not message.author.bot:
+            await self.rooms.handle_message(message)
             return
 
         if message.channel.id != self.bump_channel_id or not self._is_bump_done(message):
@@ -685,6 +695,7 @@ class Helper(discord.Client):
                 )
                 self.temp_vcs[vc.id] = time.monotonic()
                 await member.move_to(vc, reason="Join-to-Create")
+                await self.rooms.setup_room(vc, member)
                 log.info("Created temp VC %r for %s", vc.name, member)
             except discord.HTTPException as e:
                 log.warning("Join-to-Create failed for %s: %s", member, e)
@@ -716,6 +727,7 @@ class Helper(discord.Client):
 
     async def _delete_temp(self, channel):
         try:
+            self.rooms.forget_room(channel.id)
             await channel.delete(reason="Join-to-Create: room empty")
             self.temp_vcs.pop(channel.id, None)
             log.info("Deleted empty temp VC %r", channel.name)
