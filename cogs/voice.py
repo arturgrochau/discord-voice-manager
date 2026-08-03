@@ -56,11 +56,13 @@ class Voice(commands.Cog):
         # Auto-unmute: a user who joins/switches channels while server-muted
         # usually carries a stale mute from a previous session. Skip users the
         # mods intentionally sticky-muted, and skip detained users.
+        # (Deafens are cleared too: room owners hold channel-scoped deafen power,
+        # and a server-deafen would otherwise follow the victim out of the room.)
         if (
             self.bot.config.get("AUTO_UNMUTE", True)
             and after.channel is not None
             and before.channel != after.channel
-            and after.mute
+            and (after.mute or after.deaf)
         ):
             if await self.bot.db.is_sticky_muted(member.guild.id, member.id):
                 return
@@ -68,7 +70,7 @@ class Voice(commands.Cog):
             if detain_role_id and member.get_role(detain_role_id):
                 return
             try:
-                await member.edit(mute=False, reason="Sentinel auto-unmute on channel join")
+                await member.edit(mute=False, deafen=False, reason="Sentinel auto-unmute on channel join")
             except discord.HTTPException as e:
                 log.warning("Auto-unmute failed for %s: %s", member, e)
                 return
@@ -83,8 +85,10 @@ class Voice(commands.Cog):
             await self.try_dm(member, f"You were auto-unmuted upon joining a voice channel in {member.guild.name}.")
             return
 
-        # Log manual server mutes/unmutes with the acting moderator when findable.
-        if before.channel is not None and after.channel is not None and before.mute != after.mute:
+        # Log manual server mutes/deafens with the acting moderator when
+        # findable, and DM the member so nothing happens to them silently.
+        if (before.channel is not None and after.channel is not None
+                and (before.mute != after.mute or before.deaf != after.deaf)):
             actor = None
             try:
                 async for entry in member.guild.audit_logs(
@@ -95,18 +99,26 @@ class Voice(commands.Cog):
                         break
             except discord.Forbidden:
                 pass
-            action = "muted" if after.mute else "unmuted"
-            desc = f"{member.mention} was {action}"
-            if actor:
-                desc += f" by {actor.mention}"
+            if before.mute != after.mute:
+                action, emoji = ("muted", "🔇") if after.mute else ("unmuted", "🔊")
+            else:
+                action, emoji = ("deafened", "🔕") if after.deaf else ("undeafened", "🔔")
+            by = f" by {actor.mention}" if actor else ""
             embed = discord.Embed(
                 title="🎙️ Voice Mute Update",
-                description=desc + ".",
-                color=ORANGE if after.mute else GREEN,
+                description=f"{member.mention} was {action}{by} in {after.channel.mention}.",
+                color=ORANGE if (after.mute or after.deaf) else GREEN,
                 timestamp=now(),
             )
             embed.set_footer(text=f"User ID: {member.id}")
             await self.send_log(embed)
+            by_dm = f" by **{actor.display_name}**" if actor else ""
+            await self.try_dm(
+                member,
+                f"{emoji} You were **{action}**{by_dm} in **{after.channel.name}** "
+                f"({member.guild.name})."
+                + ("" if after.mute or after.deaf else " You're all clear now.")
+            )
 
     # -- commands ----------------------------------------------------------
 

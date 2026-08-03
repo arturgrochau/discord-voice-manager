@@ -60,6 +60,10 @@ class RoomManager:
         self.rooms_path = base_dir / "vc_rooms.json"
         self.minor_role_id = int(config.get("VC_MINOR_ROLE_ID", 0) or 0)
         self.rules_channel_id = int(config.get("RULES_CHANNEL_ID", 0) or 0)
+        # per-server aesthetic (falls back to Discord blurple)
+        self.color = int(str(config.get("PANEL_COLOR", "0x5865F2")), 16)
+        self.emblem = config.get("PANEL_EMBLEM", "🔊")
+        self.log_channel_id = int(config.get("VC_LOG_CHANNEL_ID", 0) or 0)
         self.prefs: dict = self._load(self.prefs_path)
         self.rooms: dict = self._load(self.rooms_path)   # cid(str) -> state
         self._ban_task = None
@@ -143,6 +147,10 @@ class RoomManager:
             await vc.send(embed=self.panel_embed(vc, owner), view=RoomPanel(self))
         except discord.HTTPException as e:
             log.warning("Panel post failed in %s: %s", vc, e)
+        try:
+            await owner.send(embed=self.owner_dm_embed(vc.guild))
+        except discord.HTTPException:
+            pass  # DMs closed — the panel covers everything anyway
 
     def forget_room(self, channel_id: int) -> None:
         """Room deleted: snapshot the owner's current settings as their prefs."""
@@ -163,25 +171,42 @@ class RoomManager:
     # -- panel -------------------------------------------------------------
 
     def panel_embed(self, vc: discord.VoiceChannel, owner: discord.Member) -> discord.Embed:
-        minors = f"`..nominors` toggle minors allowed\n" if self.minor_role_id else ""
-        rules = f"\nRoom names and statuses must stay within Discord ToS — see <#{self.rules_channel_id}>." if self.rules_channel_id else ""
         e = discord.Embed(
-            title="🔊 Room controls",
             description=(
-                f"**{owner.mention} is owner of the room!**\n\n"
-                "Use the buttons below, or type in this chat:\n"
-                "`..rename <name>` · `..status <text>` · `..setsize <n>`\n"
-                "`..ban <@user or id> [minutes]` · `..unban <@user or id>` · `..bans`\n"
-                "`..mod <@user>` / `..demod <@user>` — room mods can ban & hush\n"
-                "`..hush <@user>` / `..unhush <@user>` — mute someone in this chat\n"
-                f"`..lock` toggle lock · `..voice` toggle speaking default\n{minors}"
-                "`..claim` (owner left) · `..transfer <@user>` · `..abandon`\n\n"
-                "💡 **Right-click** members in your room for native mute/deafen/move."
-                + rules
+                f"### {self.emblem} {owner.mention} owns this room\n"
+                "Manage it with the buttons below, or type `..help` for chat commands.\n"
+                "-# ⚙️ Name · size · lock · mods · bans are remembered for your next room."
             ),
-            color=0x5865F2,
+            color=self.color,
         )
-        e.set_footer(text="Your name, size, lock, mods and bans are saved for your next room.")
+        if self.rules_channel_id:
+            e.set_footer(text="Room names & statuses must follow the server rules.")
+        return e
+
+    def owner_dm_embed(self, guild: discord.Guild) -> discord.Embed:
+        minors = " · `..nominors`" if self.minor_role_id else ""
+        e = discord.Embed(
+            title=f"{self.emblem} Your room in {guild.name}",
+            description=(
+                "You own it — buttons are in the room chat, and every command "
+                "below works there too.\n\n"
+                "**Setup**\n"
+                "`..rename <name>` · `..status <text>` · `..setsize <0-99>`\n\n"
+                "**Access**\n"
+                f"`..lock` · `..voice` (speaking default){minors}\n\n"
+                "**People**\n"
+                "`..ban <@user> [minutes]` · `..unban <@user>` · `..bans`\n"
+                "`..mod <@user>` / `..demod <@user>` — trusted helpers\n"
+                "`..hush <@user>` / `..unhush <@user>` — chat-mute\n\n"
+                "**Ownership**\n"
+                "`..transfer <@user>` · `..abandon` — and `..claim` if an owner leaves\n\n"
+                "-# 💡 Right-click members in your room for native mute · deafen · move.\n"
+                "-# ⚙️ Your setup is saved and restored on your next room."
+            ),
+            color=self.color,
+        )
+        if self.rules_channel_id:
+            e.set_footer(text="Keep names and statuses within the server rules.")
         return e
 
     # -- primitives --------------------------------------------------------
@@ -195,6 +220,24 @@ class RoomManager:
         ow = vc.overwrites_for(vc.guild.default_role)
         ow.speak = None if speak else False
         await vc.set_permissions(vc.guild.default_role, overwrite=ow, reason="Room voice-default toggle")
+
+    async def _log(self, vc, text: str) -> None:
+        """Room events go to the voice log so moderation stays transparent."""
+        channel = self.client.get_channel(self.log_channel_id)
+        if channel is None:
+            return
+        try:
+            await channel.send(embed=discord.Embed(
+                description=f"{self.emblem} **{vc.name}** — {text}", color=self.color))
+        except discord.HTTPException:
+            pass
+
+    @staticmethod
+    async def _dm(member: discord.Member, text: str) -> None:
+        try:
+            await member.send(text)
+        except discord.HTTPException:
+            pass
 
     async def set_status(self, vc: discord.VoiceChannel, status: str) -> None:
         route = discord.http.Route("PUT", "/channels/{channel_id}/voice-status",
@@ -298,6 +341,10 @@ class RoomManager:
         if not minutes and member.id not in self.prefs.setdefault(str(state["owner"]), {}).setdefault("bans", []):
             self.prefs[str(state["owner"])]["bans"].append(member.id)
         self._save()
+        span = f" for {minutes} min" if minutes else ""
+        await self._log(vc, f"{member.mention} was **room-banned**{span} by {actor.mention}.")
+        await self._dm(member, f"🔨 You were banned from the voice room **{vc.name}**{span} "
+                               f"by **{actor.display_name}** ({vc.guild.name}).")
         return (f"🔨 {member.mention} banned from this room"
                 + (f" for **{minutes} min**." if minutes else " (saved for your future rooms)."))
 
@@ -311,6 +358,9 @@ class RoomManager:
         if member.id in owner_prefs.get("bans", []):
             owner_prefs["bans"].remove(member.id)
         self._save()
+        await self._log(vc, f"{member.mention} was **unbanned** by {actor.mention}.")
+        await self._dm(member, f"♻️ Your ban from the voice room **{vc.name}** was lifted "
+                               f"by **{actor.display_name}** ({vc.guild.name}).")
         return f"♻️ {member.mention} unbanned from this room."
 
     def bans_text(self, vc) -> str:
@@ -332,6 +382,7 @@ class RoomManager:
             if member.id not in state["mods"]:
                 state["mods"].append(member.id)
             msg = f"🛡️ {member.mention} is now a **room mod** (can ban & hush here)."
+            await self._log(vc, f"{member.mention} was made **room mod** by {actor.mention}.")
         else:
             await vc.set_permissions(member, overwrite=None, reason=f"Room demod by {actor}")
             if member.id in state["mods"]:
@@ -358,6 +409,10 @@ class RoomManager:
         if not on and member.id in state["hushed"]:
             state["hushed"].remove(member.id)
         self._save()
+        await self._log(vc, f"{member.mention} was **{'hushed' if on else 'unhushed'}** by {actor.mention}.")
+        if on:
+            await self._dm(member, f"🤫 You were hushed (chat-muted) in the voice room "
+                                   f"**{vc.name}** by **{actor.display_name}** ({vc.guild.name}).")
         return (f"🤫 {member.mention} can no longer type in this chat."
                 if on else f"💬 {member.mention} can type again.")
 
@@ -396,6 +451,7 @@ class RoomManager:
         state["owner"] = member.id
         self._save()
         await vc.set_permissions(member, overwrite=_owner_overwrite(), reason=f"Room {verb}")
+        await self._log(vc, f"{member.mention} {verb} the room.")
         return f"👑 {member.mention} has {verb} the room!"
 
     async def act_random(self, vc, actor) -> str:
@@ -556,6 +612,15 @@ class RoomPanel(discord.ui.View):
     def __init__(self, mgr: RoomManager):
         super().__init__(timeout=None)
         self.mgr = mgr
+        if mgr.minor_role_id:
+            btn = discord.ui.Button(label="Minors", emoji="🔞",
+                                    style=discord.ButtonStyle.secondary,
+                                    custom_id="vcr:minors", row=1)
+            async def _minors(interaction: discord.Interaction):
+                if (vc := await self._guard(interaction)):
+                    await self._reply(interaction, await self.mgr.act_nominors(vc, interaction.user), announce=True)
+            btn.callback = _minors
+            self.add_item(btn)
 
     async def _guard(self, interaction: discord.Interaction) -> discord.VoiceChannel | None:
         vc = interaction.channel
@@ -595,19 +660,19 @@ class RoomPanel(discord.ui.View):
                 _TextModal(self.mgr, vc, "size", "Room size", "Max members (0 = unlimited)", 2))
 
     @discord.ui.button(label="Lock", emoji="🔒", style=discord.ButtonStyle.secondary,
-                       custom_id="vcr:lock", row=0)
+                       custom_id="vcr:lock", row=1)
     async def b_lock(self, interaction, _):
         if (vc := await self._guard(interaction)):
             await self._reply(interaction, await self.mgr.act_lock(vc, interaction.user), announce=True)
 
     @discord.ui.button(label="Voice", emoji="🎙️", style=discord.ButtonStyle.secondary,
-                       custom_id="vcr:voice", row=0)
+                       custom_id="vcr:voice", row=1)
     async def b_voice(self, interaction, _):
         if (vc := await self._guard(interaction)):
             await self._reply(interaction, await self.mgr.act_voice(vc, interaction.user), announce=True)
 
     @discord.ui.button(label="Ban", emoji="🔨", style=discord.ButtonStyle.danger,
-                       custom_id="vcr:ban", row=1)
+                       custom_id="vcr:ban", row=2)
     async def b_ban(self, interaction, _):
         if (vc := await self._guard(interaction)):
             await interaction.response.send_message(
@@ -615,20 +680,20 @@ class RoomPanel(discord.ui.View):
                 view=_MemberAction(self.mgr, vc, "ban"), ephemeral=True)
 
     @discord.ui.button(label="Unban", emoji="♻️", style=discord.ButtonStyle.secondary,
-                       custom_id="vcr:unban", row=1)
+                       custom_id="vcr:unban", row=2)
     async def b_unban(self, interaction, _):
         if (vc := await self._guard(interaction)):
             await interaction.response.send_message(
                 "Who do you want to unban?", view=_MemberAction(self.mgr, vc, "unban"), ephemeral=True)
 
     @discord.ui.button(label="Bans", emoji="📋", style=discord.ButtonStyle.secondary,
-                       custom_id="vcr:bans", row=1)
+                       custom_id="vcr:bans", row=2)
     async def b_bans(self, interaction, _):
         if (vc := await self._guard(interaction)):
             await interaction.response.send_message(self.mgr.bans_text(vc), ephemeral=True)
 
     @discord.ui.button(label="Mod", emoji="🛡️", style=discord.ButtonStyle.secondary,
-                       custom_id="vcr:mod", row=1)
+                       custom_id="vcr:mod", row=2)
     async def b_mod(self, interaction, _):
         if (vc := await self._guard(interaction)):
             await interaction.response.send_message(
@@ -636,7 +701,7 @@ class RoomPanel(discord.ui.View):
                 view=_MemberAction(self.mgr, vc, "mod"), ephemeral=True)
 
     @discord.ui.button(label="Hush", emoji="🤫", style=discord.ButtonStyle.secondary,
-                       custom_id="vcr:hush", row=1)
+                       custom_id="vcr:hush", row=2)
     async def b_hush(self, interaction, _):
         if (vc := await self._guard(interaction)):
             await interaction.response.send_message(
@@ -644,19 +709,19 @@ class RoomPanel(discord.ui.View):
                 view=_MemberAction(self.mgr, vc, "hush"), ephemeral=True)
 
     @discord.ui.button(label="Random", emoji="🎲", style=discord.ButtonStyle.secondary,
-                       custom_id="vcr:random", row=2)
+                       custom_id="vcr:random", row=0)
     async def b_random(self, interaction, _):
         if (vc := await self._guard(interaction)):
             await self._reply(interaction, await self.mgr.act_random(vc, interaction.user))
 
     @discord.ui.button(label="Claim", emoji="👑", style=discord.ButtonStyle.success,
-                       custom_id="vcr:claim", row=2)
+                       custom_id="vcr:claim", row=3)
     async def b_claim(self, interaction, _):
         if (vc := await self._guard(interaction)):
             await self._reply(interaction, await self.mgr.act_claim(vc, interaction.user), announce=True)
 
     @discord.ui.button(label="Transfer", emoji="➡️", style=discord.ButtonStyle.secondary,
-                       custom_id="vcr:transfer", row=2)
+                       custom_id="vcr:transfer", row=3)
     async def b_transfer(self, interaction, _):
         if (vc := await self._guard(interaction)):
             await interaction.response.send_message(
@@ -664,7 +729,7 @@ class RoomPanel(discord.ui.View):
                 view=_MemberAction(self.mgr, vc, "transfer"), ephemeral=True)
 
     @discord.ui.button(label="Abandon", emoji="🏳️", style=discord.ButtonStyle.danger,
-                       custom_id="vcr:abandon", row=2)
+                       custom_id="vcr:abandon", row=3)
     async def b_abandon(self, interaction, _):
         if (vc := await self._guard(interaction)):
             await self._reply(interaction, await self.mgr.act_abandon(vc, interaction.user), announce=True)
