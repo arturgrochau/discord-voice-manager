@@ -301,25 +301,40 @@ class Moderation(commands.Cog):
 
     # -- channel tools -----------------------------------------------------
 
-    @commands.hybrid_command(name="purge", aliases=["prune"], description="Delete the last N messages in this channel (max 100).")
-    @app_commands.describe(amount="How many messages", member="Only delete this member's messages")
-    @app_commands.default_permissions(manage_messages=True)
-    @commands.has_permissions(manage_messages=True)
-    async def purge(self, ctx: commands.Context, amount: commands.Range[int, 1, 100], member: discord.Member | None = None):
-        await ctx.defer(ephemeral=True)
-        if ctx.interaction is None:
-            # prefix invocation: delete the ".purge" message itself too
-            try:
-                await ctx.message.delete()
-            except discord.HTTPException:
-                pass
+    async def _do_purge(self, ctx_or_itx, channel, author, amount: int, member):
         check = (lambda m: m.author.id == member.id) if member else (lambda m: True)
-        deleted = await ctx.channel.purge(limit=amount, check=check, reason=f"Purge by {ctx.author}")
-        await ctx.send(f"🧹 Deleted {len(deleted)} message(s).", ephemeral=True, delete_after=5)
+        deleted = await channel.purge(limit=amount, check=check, reason=f"Purge by {author}")
         await self.send_log(mod_embed("🧹 Messages Purged",
-                                      f"{len(deleted)} message(s) purged in {ctx.channel.mention} by {ctx.author.mention}"
+                                      f"{len(deleted)} message(s) purged in {channel.mention} by {author.mention}"
                                       + (f" (from {member.mention})" if member else "") + ".",
                                       BLUE))
+        return len(deleted)
+
+    @app_commands.command(name="purge", description="Delete the last N messages in this channel (max 100).")
+    @app_commands.describe(amount="How many messages", member="Only delete this member's messages")
+    @app_commands.default_permissions(manage_messages=True)
+    async def purge_slash(self, interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100], member: discord.Member | None = None):
+        await interaction.response.defer(ephemeral=True)
+        n = await self._do_purge(interaction, interaction.channel, interaction.user, amount, member)
+        await interaction.followup.send(f"🧹 Deleted {n} message(s).", ephemeral=True)
+
+    @commands.command(name="purge", aliases=["prune"])
+    @commands.has_permissions(manage_messages=True)
+    async def purge_prefix(self, ctx: commands.Context,
+                           first: discord.Member | int,
+                           second: discord.Member | int | None = None):
+        """.prune N — delete last N messages; .prune @user N (either order) — only theirs."""
+        amount = next((a for a in (first, second) if isinstance(a, int)), None)
+        member = next((a for a in (first, second) if isinstance(a, discord.Member)), None)
+        if amount is None:
+            return await ctx.reply("Usage: `.prune N` or `.prune @user N`")
+        amount = max(1, min(100, amount))
+        try:
+            await ctx.message.delete()
+        except discord.HTTPException:
+            pass
+        n = await self._do_purge(ctx, ctx.channel, ctx.author, amount, member)
+        await ctx.send(f"🧹 Deleted {n} message(s).", delete_after=5)
 
     @app_commands.command(name="slowmode", description="Set slowmode delay for this channel (seconds; 0 to disable).")
     @app_commands.default_permissions(manage_channels=True)
