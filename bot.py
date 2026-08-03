@@ -98,7 +98,7 @@ class Sentinel(commands.Bot):
         await self.db.setup()
         self.tree.on_error = self.on_app_command_error
 
-        for ext in ("cogs.voice", "cogs.moderation", "cogs.info"):
+        for ext in ("cogs.voice", "cogs.moderation", "cogs.info", "cogs.xp"):
             await self.load_extension(ext)
             log.info("Loaded extension %s", ext)
 

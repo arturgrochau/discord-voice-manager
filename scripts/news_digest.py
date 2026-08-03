@@ -132,9 +132,11 @@ high-follower news/commentary accounts such as: elonmusk, Reuters, AFP,
 SkyNews, BBCWorld, BBCBreaking, FT, Bloomberg, WSJ, POLITICOEurope,
 euronews, DWNews, visegrad24, MarioNawfal, RadioGenoa, disclosetv,
 spectatorindex, GlobeEyeNews, AFpost. @elonmusk is a priority source —
-check site:x.com/elonmusk for relevant recent posts, and prefer the takes
-of major European sovereignty-minded figures (Farage, Weidel, Salvini,
-Abascal, Orbán, Wilders, Meloni) when they posted about a breaking story.
+check site:x.com/elonmusk for relevant recent posts, and also check the
+news/commentary accounts he follows and amplifies (his replies and reposts
+are a strong signal of which accounts to check). Prefer the takes of major
+European sovereignty-minded figures (Farage, Weidel, Salvini, Abascal,
+Orbán, Wilders, Meloni) when they posted about a breaking story.
 
 {skip_note}"""
 

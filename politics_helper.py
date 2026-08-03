@@ -135,6 +135,8 @@ class Helper(discord.Client):
             self.loop.create_task(self._bump_bootstrap())
         if self.general_channel_id:
             self.loop.create_task(self._quote_loop())
+        if self.ladder and self.config.get("LADDER_MIN_RANK_DAYS"):
+            self.loop.create_task(self._pending_promotions_loop())
 
         # rebuild the open-ticket map from channel topics (restart-safe)
         if self.modmail_category_id:
@@ -494,16 +496,73 @@ class Helper(discord.Client):
             await asyncio.sleep(QUOTE_INTERVAL)
 
     # -- ladder promotions -------------------------------------------------
+    # Promotion keeps only the highest rung. Optionally (LADDER_MIN_RANK_DAYS)
+    # a promotion also requires TIME at the previous rank: XP alone reaches the
+    # gate, but the new role only sticks once the tenure is served — the helper
+    # defers it and applies it automatically when the member qualifies.
+
+    def _ladder_state_load(self) -> dict:
+        try:
+            return json.loads((BASE_DIR / "ladder_state.json").read_text())
+        except Exception:
+            return {"since": {}, "pending": {}}
+
+    def _ladder_state_save(self, state: dict) -> None:
+        (BASE_DIR / "ladder_state.json").write_text(json.dumps(state))
+
+    def _min_days(self, rung_index: int) -> float:
+        days = self.config.get("LADDER_MIN_RANK_DAYS", [])
+        try:
+            return float(days[rung_index])
+        except (IndexError, TypeError, ValueError):
+            return 0.0
 
     async def on_member_update(self, before, after):
-        """Promotion semantics for the level ladder: keep only the highest rung."""
         if not self.ladder or after.guild.id != self.guild_id:
             return
         before_ids = {r.id for r in before.roles}
         gained = [r for r in self.ladder if r in {x.id for x in after.roles} and r not in before_ids]
         if not gained:
             return
+        import time as _t
+
+        state = self._ladder_state_load()
+        uid = str(after.id)
         top = max(self.ladder.index(r) for r in gained)
+        top_role_id = self.ladder[top]
+        required = self._min_days(top) * 86400
+
+        # tenure gate: how long has the member held the rung below?
+        held_since = state["since"].get(uid, {}).get(str(self.ladder[top - 1])) if top else None
+        pending = state["pending"].get(uid)
+        gate = required > 0 and (
+            pending is not None  # already waiting on a promotion: keep waiting
+            or (held_since is not None and _t.time() - held_since < required)
+        )
+        if gate:
+            eligible_at = (pending or {}).get("eligible_at") or (held_since + required)
+            role = after.guild.get_role(top_role_id)
+            try:
+                if role and role in after.roles:
+                    await after.remove_roles(role, reason="Ladder: tenure not yet served — promotion deferred")
+            except discord.HTTPException as e:
+                log.warning("Deferred-promotion removal failed for %s: %s", after, e)
+            state["pending"][uid] = {"role": top_role_id, "eligible_at": eligible_at}
+            self._ladder_state_save(state)
+            days_left = max(0.0, (eligible_at - _t.time()) / 86400)
+            await self._try_dm(
+                after,
+                f"🎖️ You've earned the XP for **{role.name if role else 'your next rank'}** in "
+                f"**{after.guild.name}**! Ranks also take time — yours unlocks automatically in "
+                f"about **{days_left:.1f} day(s)**. Keep it up!",
+            )
+            log.info("Deferred promotion for %s: %s in %.1fd", after, top_role_id, days_left)
+            return
+
+        # promotion proceeds: record tenure start, strip superseded rungs
+        state["since"].setdefault(uid, {})[str(top_role_id)] = _t.time()
+        state["pending"].pop(uid, None)
+        self._ladder_state_save(state)
         lower = [after.guild.get_role(r) for r in self.ladder[:top]]
         lower = [r for r in lower if r and r in after.roles]
         if lower:
@@ -512,6 +571,39 @@ class Helper(discord.Client):
                 log.info("Promoted %s: removed %s", after, [r.name for r in lower])
             except discord.HTTPException as e:
                 log.warning("Ladder cleanup failed for %s: %s", after, e)
+
+    async def _pending_promotions_loop(self):
+        """Apply deferred promotions the moment their tenure is served."""
+        import asyncio
+        import time as _t
+
+        while True:
+            await asyncio.sleep(1800)
+            state = self._ladder_state_load()
+            due = {uid: p for uid, p in state["pending"].items()
+                   if p.get("eligible_at", 0) <= _t.time()}
+            if not due:
+                continue
+            guild = self.get_guild(self.guild_id)
+            if guild is None:
+                continue
+            for uid, p in due.items():
+                member = guild.get_member(int(uid))
+                role = guild.get_role(int(p["role"]))
+                state["pending"].pop(uid, None)
+                if member is None or role is None:
+                    self._ladder_state_save(state)
+                    continue
+                state["since"].setdefault(uid, {})[str(role.id)] = _t.time()
+                # save BEFORE the role add: the resulting member-update event
+                # must not see a stale pending entry and re-defer the promotion
+                self._ladder_state_save(state)
+                try:
+                    await member.add_roles(role, reason="Ladder: tenure served — deferred promotion applied")
+                    await self._try_dm(member, f"🎖️ Tenure served — you are now **{role.name}** in **{guild.name}**!")
+                    log.info("Applied deferred promotion: %s -> %s", member, role.name)
+                except discord.HTTPException as e:
+                    log.warning("Deferred promotion failed for %s: %s", member, e)
 
     # -- reaction roles ----------------------------------------------------
 
