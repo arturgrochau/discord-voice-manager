@@ -301,7 +301,7 @@ class Moderation(commands.Cog):
 
     # -- channel tools -----------------------------------------------------
 
-    @commands.hybrid_command(name="purge", description="Delete the last N messages in this channel (max 100).")
+    @commands.hybrid_command(name="purge", aliases=["prune"], description="Delete the last N messages in this channel (max 100).")
     @app_commands.describe(amount="How many messages", member="Only delete this member's messages")
     @app_commands.default_permissions(manage_messages=True)
     @commands.has_permissions(manage_messages=True)
