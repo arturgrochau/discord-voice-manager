@@ -290,7 +290,11 @@ class Helper(discord.Client):
         await self.contest.on_message(message)
         # ..music commands work from any chat; room commands only in room chats
         content = (message.content or "").strip()
-        if content.startswith("..") and not message.author.bot:
+        # self-authored commands allowed: lets the operator drive the player
+        # through the bot's own account for remote tests and DJ duty
+        author_ok = (not message.author.bot
+                     or (self.user and message.author.id == self.user.id))
+        if content.startswith("..") and author_ok:
             cmd, _, arg = content[2:].partition(" ")
             cmd = cmd.lower()
             if cmd in ("commands", "cmds"):

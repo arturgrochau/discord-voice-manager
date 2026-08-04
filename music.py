@@ -53,8 +53,11 @@ def _fmt_dur(seconds) -> str:
     return f"{s // 3600}:{s % 3600 // 60:02}:{s % 60:02}" if s >= 3600 else f"{s // 60}:{s % 60:02}"
 
 
+DOWNLOAD_MAX_SECONDS = 15 * 60  # songs get fully downloaded; longer = stream
+
+
 class Track:
-    __slots__ = ("title", "url", "duration", "requester_id", "retried")
+    __slots__ = ("title", "url", "duration", "requester_id", "retried", "path")
 
     def __init__(self, title, url, duration, requester_id):
         self.title = title
@@ -62,12 +65,15 @@ class Track:
         self.duration = duration
         self.requester_id = requester_id
         self.retried = False  # one free retry when a stream dies mid-track
+        self.path = None      # local file when the track was pre-downloaded
 
 
 class MusicPlayer:
     def __init__(self, client: discord.Client, config: dict, base_dir: Path | None = None):
         self.client = client
         self.state_path = (base_dir or Path(".")) / "music_state.json"
+        self.cache_dir = (base_dir or Path(".")) / "music_cache"
+        self._last_channel_id = 0  # watchdog reconnect target
         self.enabled = bool(config.get("MUSIC_ENABLED"))
         self.idle_seconds = int(config.get("MUSIC_IDLE_SECONDS", IDLE_SECONDS_DEFAULT))
         self.color = int(str(config.get("PANEL_COLOR", "0x5865F2")), 16)
@@ -129,6 +135,7 @@ class MusicPlayer:
             log.warning("Music restore: reconnect failed: %s", e)
             self._clear_state()
             return
+        self._last_channel_id = ch.id
         log.info("Music restore: resuming %d track(s) in %s", len(self.queue), ch.name)
         if self.text_channel:
             try:
@@ -165,28 +172,57 @@ class MusicPlayer:
             return self._ydl().extract_info(query, download=False, process=flat)
         return await self.client.loop.run_in_executor(None, work)
 
-    async def _stream_url(self, track: Track) -> str | None:
-        """Fresh extraction right before playback: stream URLs expire."""
+    async def _prepare_source(self, track: Track) -> tuple[str, bool] | None:
+        """Get something ffmpeg can play. Returns (source, is_local).
+
+        Song-length tracks are fully downloaded first — a local file cannot
+        die to a YouTube 403/throttle mid-play, which is the classic way
+        music bots 'randomly stop'. Long tracks and livestreams still stream
+        (with ffmpeg reconnect flags) to avoid huge downloads.
+        """
+        if track.path and Path(track.path).exists():
+            return track.path, True  # retry reuses the finished download
+
         def work():
             import yt_dlp
-            with yt_dlp.YoutubeDL({"format": "bestaudio/best", "quiet": True,
-                                   "no_warnings": True, "noplaylist": True,
-                                   "socket_timeout": 10, "noprogress": True}) as y:
-                info = y.extract_info(track.url, download=False)
-            return info.get("url")
+            want_dl = track.duration is not None and 0 < int(track.duration or 0) <= DOWNLOAD_MAX_SECONDS
+            opts = {"format": "bestaudio/best", "quiet": True, "no_warnings": True,
+                    "noplaylist": True, "socket_timeout": 15, "noprogress": True,
+                    "retries": 3, "fragment_retries": 5}
+            if want_dl:
+                self.cache_dir.mkdir(exist_ok=True)
+                opts["outtmpl"] = str(self.cache_dir / "%(id)s.%(ext)s")
+            with yt_dlp.YoutubeDL(opts) as y:
+                info = y.extract_info(track.url, download=want_dl)
+                if want_dl:
+                    return y.prepare_filename(info), True
+                return info.get("url"), False
+
         try:
-            return await self.client.loop.run_in_executor(None, work)
+            src, local = await self.client.loop.run_in_executor(None, work)
         except Exception as e:
-            log.warning("Extraction failed for %s: %s", track.url, e)
+            log.warning("Prepare failed for %s: %s", track.url, e)
             return None
+        if src is None:
+            return None
+        if local:
+            track.path = src
+        return src, local
 
     # -- voice lifecycle ---------------------------------------------------
 
-    async def _ensure_voice(self, member: discord.Member) -> str | None:
+    async def _ensure_voice(self, member: discord.Member,
+                            fallback: discord.VoiceChannel | None = None) -> str | None:
         """Join the member's channel. Returns an error string or None."""
         if member.voice is None or member.voice.channel is None:
-            return "Join a voice channel first, then I'll follow you in."
-        target = member.voice.channel
+            # self-authored ops command typed in a voice chat: that channel is
+            # the target (the bot has no voice state of its own to follow)
+            if fallback is not None and member.id == getattr(self.client.user, "id", 0):
+                target = fallback
+            else:
+                return "Join a voice channel first, then I'll follow you in."
+        else:
+            target = member.voice.channel
         if self.voice and self.voice.is_connected():
             if self.voice.channel.id == target.id:
                 return None
@@ -196,12 +232,15 @@ class MusicPlayer:
                     return (f"I'm playing for people in **{self.voice.channel.name}**, "
                             f"join there, or wait until the session ends.")
             await self.voice.move_to(target)
+            self._last_channel_id = target.id
             return None
         try:
             self.voice = await target.connect(self_deaf=True)
         except (discord.HTTPException, asyncio.TimeoutError) as e:
             log.warning("Voice connect failed: %s", e)
             return "Couldn't connect to voice, try again in a moment."
+        self._last_channel_id = target.id
+        log.info("Voice connected: %s", target.name)
         self._idle_since = time.monotonic()
         return None
 
@@ -228,7 +267,12 @@ class MusicPlayer:
         while True:
             await asyncio.sleep(30)
             try:
+                self._purge_cache()
                 if not (self.voice and self.voice.is_connected()):
+                    # watchdog: a session with work left shouldn't be silent —
+                    # a dropped voice gateway gets reconnected and resumed
+                    if (self.current or self.queue) and self._last_channel_id:
+                        await self._watchdog_resume()
                     continue
                 humans = [m for m in self.voice.channel.members if not m.bot]
                 if not humans:
@@ -243,6 +287,43 @@ class MusicPlayer:
             except Exception:
                 log.exception("Music idle loop error")
 
+    async def _watchdog_resume(self) -> None:
+        ch = self.client.get_channel(self._last_channel_id)
+        humans = [m for m in ch.members if not m.bot] if ch else []
+        if not humans:
+            self.current = None
+            self.queue.clear()
+            self._clear_state()
+            return
+        log.warning("Music watchdog: voice dropped mid-session, reconnecting to %s", ch.name)
+        if self.voice:
+            try:
+                await self.voice.disconnect(force=True)
+            except discord.HTTPException:
+                pass
+            self.voice = None
+        try:
+            self.voice = await ch.connect(self_deaf=True, timeout=15)
+        except Exception as e:
+            log.warning("Music watchdog: reconnect failed (%s), retrying next pass", e)
+            return
+        if self.current:
+            self.queue.insert(0, self.current)
+            self.current = None
+        await self._advance()
+
+    def _purge_cache(self) -> None:
+        """Downloaded tracks are throwaway: drop anything older than 3 h."""
+        try:
+            if not self.cache_dir.exists():
+                return
+            cutoff = time.time() - 3 * 3600
+            for f in self.cache_dir.iterdir():
+                if f.is_file() and f.stat().st_mtime < cutoff:
+                    f.unlink(missing_ok=True)
+        except OSError:
+            pass
+
     # -- playback ----------------------------------------------------------
 
     async def _advance(self) -> None:
@@ -254,18 +335,23 @@ class MusicPlayer:
                 if not (self.voice and self.voice.is_connected()):
                     return
                 track = self.queue.pop(0)
-                stream = await self._stream_url(track)
-                if stream is None:
+                prepared = await self._prepare_source(track)
+                if prepared is None:
                     if self.text_channel:
                         await self.text_channel.send(
                             embed=self._embed(f"Skipping **{track.title}**, couldn't load it."),
                             delete_after=60)
                     continue
+                source, is_local = prepared
                 src = discord.PCMVolumeTransformer(
-                    discord.FFmpegPCMAudio(stream, before_options=FFMPEG_BEFORE,
-                                           options=FFMPEG_OPTS),
+                    discord.FFmpegPCMAudio(
+                        source,
+                        before_options=None if is_local else FFMPEG_BEFORE,
+                        options=FFMPEG_OPTS),
                     volume=self.volume)
                 self.current = track
+                log.info("Now playing: %s (%s)", track.title,
+                         "downloaded" if is_local else "streaming")
 
                 def after(err, _self=self, _track=track):
                     if err:
@@ -336,8 +422,9 @@ class MusicPlayer:
             except discord.HTTPException:
                 pass
 
+        fallback = message.channel if isinstance(message.channel, discord.VoiceChannel) else None
         if cmd in ("summon", "music", "join"):
-            err = await self._ensure_voice(member)
+            err = await self._ensure_voice(member, fallback)
             await say(err or (
                 f"{self.emblem} In **{self.voice.channel.name}**. `..play <name or link>` to start."
                 "\n-# Music sessions don't earn giveaway points."))
@@ -347,7 +434,7 @@ class MusicPlayer:
             if not arg:
                 await say("Usage: `..play <song name or YouTube link>`")
                 return
-            err = await self._ensure_voice(member)
+            err = await self._ensure_voice(member, fallback)
             if err:
                 await say(err)
                 return
