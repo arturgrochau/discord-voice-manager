@@ -399,25 +399,59 @@ class Moderation(commands.Cog):
     @commands.command(name="purge", aliases=["prune", "p"])
     @staff_command()
     async def purge_prefix(self, ctx: commands.Context, *, args: str = ""):
-        """.p N | .p @user N | .p [N] "text" | .p [N] !"text" — any order.
+        """.p N | .p @user N | .p [N] text | .p [N] !text — any order.
 
-        A text filter deletes only messages containing it (or NOT containing
-        it with a leading !), case-insensitive, scanning the last N messages
-        (N defaults to your prune cap).
+        Text filter deletes only messages containing it (or NOT containing it
+        with a leading !), case-insensitive, scanning the last N messages.
+
+        Admin tier only: `.p <@user|id> all` (or a big N) sweeps that user's
+        ENTIRE history in the channel — paginating past the 100-message and
+        14-day limits with a rate-limit-aware queue that runs in the
+        background. A bare id works even if the user already left.
         """
+        deep = False
         amount = None
         member = None
+        user_id = None
         rest: list[str] = []
         for tok in args.split():
-            if amount is None and tok.isdigit():
+            low = tok.lower()
+            if low in ("all", "everything", "*"):
+                deep = True
+            elif amount is None and tok.isdigit() and len(tok) < 6:
                 amount = int(tok)
             elif member is None and (m := re.fullmatch(r"<@!?(\d+)>", tok)):
                 member = ctx.guild.get_member(int(m.group(1)))
+                user_id = int(m.group(1))
+            elif user_id is None and tok.isdigit() and len(tok) >= 6:  # raw id
+                user_id = int(tok)
+                member = ctx.guild.get_member(user_id)
             else:
                 rest.append(tok)
         text = " ".join(rest).strip()
         negate = text.startswith("!")
         text = text.lstrip("!").strip().strip('"“”\'').strip() or None
+
+        is_admin = is_staff(self.bot, ctx.author, admin_only=True)
+        # Deep per-user sweep: admin tier, a user target, and either `all` or a
+        # count above the normal cap. Runs in the background over full history.
+        if user_id is not None and (deep or (amount is not None and amount > self.prune_cap(ctx.author))):
+            if not is_admin:
+                return await ctx.reply("⛔ Full-history user purge is admin-tier only.")
+            limit = 100_000 if deep else amount
+            try:
+                await ctx.message.delete()
+            except discord.HTTPException:
+                pass
+            self.bot.loop.create_task(
+                self._deep_purge_user(ctx.channel, user_id, limit, ctx.author, text, negate))
+            who = member.mention if member else f"`{user_id}`"
+            return await ctx.send(
+                f"🧹 Queued a full-history purge of {who}'s messages"
+                + (f" containing **{text}**" if text else "")
+                + ". This runs in the background and can take a while; I'll report when done.",
+                delete_after=30)
+
         cap = self.prune_cap(ctx.author)
         if amount is None:
             amount = cap
@@ -432,6 +466,84 @@ class Moderation(commands.Cog):
         what = (f" containing **{text}**" if text and not negate else
                 f" not containing **{text}**" if text else "")
         await ctx.send(f"🧹 Deleted {n} message(s){what}.", delete_after=5)
+
+    async def _deep_purge_user(self, channel, user_id: int, limit: int, actor,
+                               text: str | None = None, negate: bool = False):
+        """Delete up to `limit` of one user's messages across the whole channel
+        history. Individual deletes with 429 backoff, so it bypasses the
+        100-message bulk cap and the 14-day age limit. Bursts via bulk-delete
+        for recent (<14d) messages, falls back to single deletes for old ones."""
+        import asyncio
+        from datetime import datetime, timedelta, timezone
+
+        needle = (text or "").casefold()
+
+        def match(m):
+            if m.author.id != user_id or m.pinned:
+                return False
+            if needle:
+                has = needle in (m.content or "").casefold()
+                return (not has) if negate else has
+            return True
+
+        deleted = 0
+        cutoff = datetime.now(timezone.utc) - timedelta(days=13, hours=12)
+        recent_batch: list = []
+        try:
+            async for msg in channel.history(limit=None, oldest_first=False):
+                if deleted >= limit:
+                    break
+                if not match(msg):
+                    continue
+                if msg.created_at > cutoff:
+                    recent_batch.append(msg)
+                    if len(recent_batch) >= 100:
+                        try:
+                            await channel.delete_messages(recent_batch)
+                            deleted += len(recent_batch)
+                        except discord.HTTPException:
+                            for m in recent_batch:  # fall back to singles
+                                try:
+                                    await m.delete(); deleted += 1
+                                    await asyncio.sleep(1.0)
+                                except discord.HTTPException:
+                                    pass
+                        recent_batch.clear()
+                        await asyncio.sleep(1.0)
+                else:
+                    for attempt in range(6):
+                        try:
+                            await msg.delete(); deleted += 1
+                            await asyncio.sleep(1.0)  # old-message delete bucket
+                            break
+                        except discord.HTTPException as e:
+                            if getattr(e, "status", None) == 429:
+                                await asyncio.sleep(float(getattr(e, "retry_after", 3)) + 0.5)
+                            else:
+                                break
+            if recent_batch:
+                try:
+                    await channel.delete_messages(recent_batch)
+                    deleted += len(recent_batch)
+                except discord.HTTPException:
+                    for m in recent_batch:
+                        try:
+                            await m.delete(); deleted += 1
+                            await asyncio.sleep(1.0)
+                        except discord.HTTPException:
+                            pass
+        except Exception:
+            log.exception("Deep purge error")
+        await self.send_log(mod_embed(
+            "🧹 Full-History Purge",
+            f"Removed **{deleted}** message(s) from user `{user_id}` in {channel.mention}, "
+            f"requested by {actor.mention}" + (f" (filter: {text!r})" if text else "") + ".",
+            BLUE))
+        try:
+            await channel.send(f"🧹 Full-history purge complete: **{deleted}** message(s) removed.",
+                               delete_after=30)
+        except discord.HTTPException:
+            pass
 
     @app_commands.command(name="slowmode", description="Set slowmode delay for this channel (seconds; 0 to disable).")
     @app_commands.default_permissions(manage_channels=True)
