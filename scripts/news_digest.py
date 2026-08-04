@@ -67,20 +67,26 @@ SCHEMA = json.dumps({
 })
 
 SECTION_RULES = """Section definitions — file every story in exactly ONE
-best-fitting section:
-- WORLD EVENTS: geopolitics OUTSIDE Europe — wars, diplomacy, elections and
-  crises in the US, Asia, Middle East, Africa, the Americas — prioritising
-  what affects Europe's position in the world.
-- EUROPE NEWS: politics and society INSIDE Europe — EU institutions,
-  national governments and elections, migration and borders, security and
-  policing, courts, protests, major social debates. European weather,
-  climate events and disasters belong HERE, never in econ-tech.
+best-fitting section, by WHERE the event happens and WHAT it is about:
+- WORLD EVENTS: geopolitics whose centre of gravity is OUTSIDE Europe — the
+  US (incl. US domestic politics), Middle East (incl. Iran, Israel, the Gulf,
+  Strait of Hormuz), Asia, Africa, the Americas — plus multinational events
+  (UN, global summits). Prioritise what affects Europe's place in the world.
+- EUROPE NEWS: events on European soil or run by European institutions — EU
+  bodies, national governments and elections, migration and borders inside
+  Europe, security/policing, courts, protests, social debates. The
+  RUSSIA-UKRAINE WAR lives HERE (it is a war in Europe), as do European
+  weather, climate events and disasters (never econ-tech). Russia and Turkey
+  count as Europe for this purpose.
 - ECON & TECH: money and technology — markets, inflation, trade, energy
   prices and supply, industry, corporate news, tech/AI regulation and
-  breakthroughs. A story qualifies only if its CORE subject is economic or
-  technological: a heatwave is not econ-tech; an energy-price spike caused
-  by one is.
-If a story does not clearly fit any section, DROP it entirely."""
+  breakthroughs — anywhere in the world. A story qualifies only if its CORE
+  subject is economic or technological: a heatwave is not econ-tech; an
+  energy-price spike caused by one is.
+Never put the same story in two sections. If a Ukraine-war item is mainly
+about global diplomacy (e.g. US-Russia talks), it may go to WORLD; if it is
+about the fighting, sanctions, or European response, it goes to EUROPE — pick
+one. If a story does not clearly fit any section, DROP it entirely."""
 
 RESEARCH_PROMPT = """You are compiling today's ({date}) news digest for a
 European politics discussion server. The audience cares most about European
@@ -131,7 +137,18 @@ front pages of Reuters/AFP/BBC/FT/Bloomberg/Politico Europe/Euronews, plus
 stories with a real development in roughly the last 6-12 hours, but a major
 ongoing story with a meaningful new angle is fine too.
 
-Return the TOP 2 to 3 stories overall, ranked by significance and freshness.
+Return the TOP 2 to 3 stories overall, ranked by IMPORTANCE first. Rank each
+candidate by:
+  1. Significance — how many people it affects, how consequential it is.
+  2. Credible traction — how widely MAJOR outlets and high-follower credible
+     accounts are covering it, and how much genuine engagement the best posts
+     have. A story confirmed by several major outlets beats a louder one from
+     a single source.
+Use traction as a signal of importance, NOT a goal in itself: do NOT pick a
+story just because a post went viral. Skip rage-bait, engagement-bait,
+single-source rumours, and anything you cannot confirm from a major outlet.
+Prefer the story that is both important AND well-sourced.
+
 There is ALWAYS relevant news in the world — on a normal run you WILL find 2-3
 worth posting. Only return "no new stories" in the rare case where every
 genuinely significant current story is already in the covered list below.
