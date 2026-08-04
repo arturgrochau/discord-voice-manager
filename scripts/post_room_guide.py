@@ -89,7 +89,8 @@ def build_embeds(s: dict) -> list[dict]:
     )
 
     music = (
-        "`..play <name or link>` — search, direct links, playlists · "
+        "`..play <name or link>` — YouTube search, direct links, playlists, "
+        "and **Spotify** links (track / album / playlist) · "
         "`..summon` bring the bot in first\n"
         "`..skip` next track · `..pause` / `..resume` · `..stop` end the session\n"
         "`..queue` see the list · `..np` current track · `..shuffle` · `..clear` · "

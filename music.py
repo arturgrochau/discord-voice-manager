@@ -25,7 +25,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
+import urllib.request
 from pathlib import Path
 
 import discord
@@ -39,10 +41,77 @@ MAX_QUEUE = 100
 PLAYLIST_CAP = 25
 
 COMMANDS = {
-    "play", "p", "summon", "music", "join", "skip", "next", "pause",
-    "resume", "stop", "leave", "disconnect", "dc", "queue", "q", "np",
+    "play", "p", "spotify", "sp", "summon", "music", "join", "skip", "next",
+    "pause", "resume", "stop", "leave", "disconnect", "dc", "queue", "q", "np",
     "nowplaying", "vol", "volume", "shuffle", "clear",
 }
+
+_SPOTIFY_RE = re.compile(
+    r"(?:open\.spotify\.com/(?:intl-\w+/)?|spotify:)(track|album|playlist)[/:]([A-Za-z0-9]+)")
+_BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+
+def is_spotify(text: str) -> bool:
+    return bool(_SPOTIFY_RE.search(text or ""))
+
+
+def _deep_find(obj, key):
+    """First value for `key` anywhere in a nested dict/list."""
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            if key in cur:
+                return cur[key]
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+    return None
+
+
+def spotify_tracks(url: str) -> tuple[str, list[tuple[str, int]]] | None:
+    """Read a Spotify track/album/playlist link via its public embed page.
+
+    Spotify audio is DRM'd and cannot be streamed by a bot, so we lift the
+    track list (title + artist + duration) and each song is played from
+    YouTube instead. No Spotify API key needed — the embed page ships the
+    data in a __NEXT_DATA__ blob. Returns (collection_name, [(query, ms)]).
+    """
+    m = _SPOTIFY_RE.search(url)
+    if not m:
+        return None
+    kind, sid = m.group(1), m.group(2)
+    try:
+        req = urllib.request.Request(
+            f"https://open.spotify.com/embed/{kind}/{sid}",
+            headers={"User-Agent": _BROWSER_UA})
+        html = urllib.request.urlopen(req, timeout=20).read().decode("utf-8", "replace")
+    except Exception as e:
+        log.warning("Spotify fetch failed for %s: %s", url, e)
+        return None
+    mm = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
+    if not mm:
+        return None
+    try:
+        data = json.loads(mm.group(1))
+    except json.JSONDecodeError:
+        return None
+    name = _deep_find(data, "name") or "Spotify"
+    track_list = _deep_find(data, "trackList") or []
+    out: list[tuple[str, int]] = []
+    if track_list:  # album or playlist
+        for t in track_list:
+            title = (t.get("title") or "").strip()
+            artist = (t.get("subtitle") or "").strip()
+            if title:
+                out.append((f"{artist} {title}".strip(), int(t.get("duration") or 0)))
+    elif name and name != "Page not found":  # single track: entity is the song
+        artist = _deep_find(data, "subtitle") or ""
+        out.append((f"{artist} {name}".strip(), int(_deep_find(data, "duration") or 0)))
+    if name == "Page not found":
+        return None
+    return name, out
 
 
 def _fmt_dur(seconds) -> str:
@@ -196,8 +265,17 @@ class MusicPlayer:
             if want_dl:
                 self.cache_dir.mkdir(exist_ok=True)
                 opts["outtmpl"] = str(self.cache_dir / "%(id)s.%(ext)s")
+            if track.url.startswith("ytsearch"):
+                opts["default_search"] = "ytsearch1"
             with yt_dlp.YoutubeDL(opts) as y:
                 info = y.extract_info(track.url, download=want_dl)
+                if info.get("entries") is not None:  # search / playlist result
+                    entries = [e for e in info["entries"] if e]
+                    if not entries:
+                        return None, False
+                    info = entries[0]
+                    if not track.title or track.title == track.url:
+                        track.title = info.get("title") or track.title
                 if want_dl:
                     return y.prepare_filename(info), True
                 return info.get("url"), False
@@ -423,8 +501,9 @@ class MusicPlayer:
         return discord.Embed(
             title="🎵 Music commands",
             description=(
-                "**Start** — `..play <name or link>` (searches YouTube, links and "
-                "playlists work) · `..summon` pulls me into your channel\n"
+                "**Start** — `..play <name or link>` (YouTube search, links, "
+                "playlists, and **Spotify** links all work) · `..summon` pulls "
+                "me into your channel\n"
                 "**Control** — `..skip` (also `..next`) · `..pause` · `..resume` · "
                 "`..stop` (leave)\n"
                 "**Queue** — `..queue` (also `..q`) shows what's up · `..np` current "
@@ -456,9 +535,13 @@ class MusicPlayer:
                 "\n-# Music sessions don't earn giveaway points."))
             return
 
-        if cmd in ("play", "p"):
+        if cmd in ("spotify", "sp") and not is_spotify(arg):
+            await say("Usage: `..spotify <Spotify track, album or playlist link>`")
+            return
+
+        if cmd in ("play", "p", "spotify", "sp"):
             if not arg:
-                await say("Usage: `..play <song name or YouTube link>`")
+                await say("Usage: `..play <song name, YouTube or Spotify link>`")
                 return
             err = await self._ensure_voice(member, fallback)
             if err:
@@ -466,6 +549,29 @@ class MusicPlayer:
                 return
             if len(self.queue) >= MAX_QUEUE:
                 await say(f"Queue is full ({MAX_QUEUE} tracks).")
+                return
+
+            # Spotify: resolve the link to song names, each plays from YouTube
+            if is_spotify(arg):
+                resolved = await self.client.loop.run_in_executor(
+                    None, spotify_tracks, arg)
+                if not resolved or not resolved[1]:
+                    await say("Couldn't read that Spotify link. Make sure the "
+                              "playlist is public, or paste a song/album link.")
+                    return
+                name, songs = resolved
+                room = min(len(songs), MAX_QUEUE - len(self.queue), PLAYLIST_CAP)
+                for query, ms in songs[:room]:
+                    self.queue.append(Track(query, f"ytsearch1:{query}",
+                                            (ms // 1000) or None, member.id))
+                if room == 1:
+                    await say(f"{self.emblem} Queued **{songs[0][0]}** from Spotify.")
+                else:
+                    await say(f"{self.emblem} Queued **{room} tracks** from the "
+                              f"Spotify {'playlist' if room > 1 else 'set'} **{name}**.")
+                self._save_state()
+                if not self.current:
+                    await self._advance()
                 return
             try:
                 info = await self._extract(arg)
