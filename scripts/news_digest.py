@@ -118,48 +118,48 @@ sovereignty and migration stories when they posted about today's news.
 
 {skip_note}"""
 
-PULSE_RESEARCH_PROMPT = """It is {date}, {time} UTC. You are the rolling news
-desk for a European politics discussion server (audience: European
-sovereignty, EU/national politics, migration and borders, security/defence,
-energy independence, Europe's economy and tech standing).
+PULSE_RESEARCH_PROMPT = """It is {date}, {time} UTC. You are the standing news
+desk for a European politics discussion server. The audience cares about
+European sovereignty, EU and national politics, elections, migration and
+borders, security and defence, energy independence, and Europe's economic
+and technological standing (global stories count when they affect Europe).
 
-This check runs every 15 minutes around the clock. ONLY report a story if a
-discrete, significant development happened within roughly the LAST 90
-MINUTES: an announcement, decision, resignation, attack, verdict, deal, or
-data release — a hard event with a timestamp. Run several live web and X
-searches now (news sites plus `site:x.com <keywords>` queries) — do not
-answer from memory.
+Your job every run: surface the **freshest, most significant** stories this
+audience has NOT seen yet. Run MANY live web and X searches right now — the
+front pages of Reuters/AFP/BBC/FT/Bloomberg/Politico Europe/Euronews, plus
+`site:x.com <keywords>` queries — do not answer from memory. Prioritise
+stories with a real development in roughly the last 6-12 hours, but a major
+ongoing story with a meaningful new angle is fine too.
 
-What does NOT count (drop without exception):
-- Continuing situations with no new hard event — a heatwave still ongoing, a
-  war still being fought, markets drifting. A FRESH TWEET ABOUT AN OLD STORY
-  IS NOT NEWS.
-- Anything substantially similar to a story in the already-covered list
-  below, even from a different outlet or with a different framing.
-- Colour pieces, explainers, interviews, previews, anniversaries, opinion.
+Return the TOP 2 to 3 stories overall, ranked by significance and freshness.
+There is ALWAYS relevant news in the world — on a normal run you WILL find 2-3
+worth posting. Only return "no new stories" in the rare case where every
+genuinely significant current story is already in the covered list below.
+
+HARD non-redundancy rule: do NOT return anything substantially similar to a
+story in the already-covered list — not the same event from another outlet,
+not a follow-up with no new information, not a reworded headline. If your best
+pick is already covered, skip it and go to the next most significant fresh
+story. Also skip pure opinion/explainers/anniversaries; report events.
 
 {section_rules}
 
-Write a short markdown list of AT MOST 3 STORIES TOTAL across all sections,
-each labelled WORLD EVENTS / EUROPE NEWS / ECON & TECH. The bar is HIGH: on
-most runs the correct output is exactly "no new stories" — that is the
-expected result, not a failure. Never pad.
-
-For each story: a short factual headline, then every URL you actually saw in
-your search results — X status URLs (x.com/<account>/status/<id>) and article
-URLs. Copy URLs character-for-character from results; NEVER write a URL you
-did not see. If no X post turned up, say so.
+Write a short markdown list of your 2-3 picks, each labelled WORLD EVENTS /
+EUROPE NEWS / ECON & TECH. For each: a short factual headline, then every URL
+you actually saw in your search results — X status URLs
+(x.com/<account>/status/<id>) and the article URL. Copy URLs
+character-for-character from results; NEVER write a URL you did not see. If no
+strong X post exists for a story, give the article URL and say so.
 
 X post quality bar (strict): ENGLISH-language posts only, from major
 high-follower news/commentary accounts such as: elonmusk, Reuters, AFP,
-SkyNews, BBCWorld, BBCBreaking, FT, Bloomberg, WSJ, POLITICOEurope,
-euronews, DWNews, visegrad24, MarioNawfal, RadioGenoa, disclosetv,
-spectatorindex, GlobeEyeNews, AFpost. @elonmusk is a priority source —
-check site:x.com/elonmusk for relevant recent posts, and also check the
-news/commentary accounts he follows and amplifies (his replies and reposts
-are a strong signal of which accounts to check). Prefer the takes of major
-European sovereignty-minded figures (Farage, Weidel, Salvini, Abascal,
-Orbán, Wilders, Meloni) when they posted about a breaking story.
+SkyNews, BBCWorld, BBCBreaking, FT, Bloomberg, WSJ, business, POLITICOEurope,
+euronews, DWNews, spectatorindex, visegrad24, MarioNawfal, RadioGenoa,
+disclosetv, GlobeEyeNews, AFpost, BNONews, AP. @elonmusk is a priority
+source — check site:x.com/elonmusk for relevant recent posts, and the
+news/commentary accounts he amplifies. Prefer takes from major European
+sovereignty-minded figures (Farage, Weidel, Salvini, Abascal, Orbán,
+Wilders, Meloni) when they posted about a current story.
 
 {skip_note}"""
 
@@ -200,9 +200,9 @@ log = logging.getLogger("news-digest")
 HISTORY_PATH = BASE_DIR / "digest_history.json"
 PULSE_STATE_PATH = BASE_DIR / "pulse_state.json"
 
-# pulse flood guards: hourly across all sections, per section per pulse,
-# and total per single pulse run
-PULSE_HOURLY_CAP = 4
+# flow guards: with a 30-minute cadence and 2-3 fresh stories per run this
+# gives a steady ~4-6 posts/hour without flooding; dedup keeps them distinct
+PULSE_HOURLY_CAP = 6
 PULSE_SECTION_CAP = 2
 PULSE_RUN_CAP = 3
 
@@ -454,7 +454,9 @@ ENGLISH_SAFE_ACCOUNTS = {
     "elonmusk", "reuters", "afp", "skynews", "bbcworld", "bbcbreaking",
     "ft", "financialtimes", "bloomberg", "business", "wsj", "politicoeurope",
     "politico", "euronews", "dwnews", "dw_politics", "spectatorindex",
-    "eucouncil", "eu_commission",
+    "eucouncil", "eu_commission", "ap", "apnews", "bnonews", "cnbc",
+    "guardian", "guardiannews", "thetimes", "telegraph", "economist",
+    "nytimes", "cnn", "abc", "cbsnews", "nbcnews", "sky", "france24",
 }
 # Commentary/aggregator accounts: allowed, but tweet text must read as English.
 MIXED_ACCOUNTS = {
