@@ -66,6 +66,8 @@ class Moderation(commands.Cog):
         # user ids whose next detain-role change was made by a bot command,
         # so on_member_update shouldn't log it a second time
         self._suppress_role_log: set[int] = set()
+        self._ping_stop = False       # set by `.ping stop` to abort a run
+        self._ping_running = False     # only one chain-ping at a time
 
     # -- helpers -----------------------------------------------------------
 
@@ -564,6 +566,133 @@ class Moderation(commands.Cog):
                                delete_after=30)
         except discord.HTTPException:
             pass
+
+    # -- chain ping (owner / top-admin only) -------------------------------
+
+    @commands.command(name="ping")
+    async def ping_chain(self, ctx: commands.Context, *, args: str = ""):
+        """`.ping <ids | @users | @roles | role names | everyone>` — notify each
+        target individually: post a mention, let the notification fire, delete
+        it, move on. Keeps the channel clean while everyone still gets pinged.
+        Admin tier only (owner / XOXO). `.ping stop` aborts a running chain.
+        """
+        if not is_staff(self.bot, ctx.author, admin_only=True):
+            return  # silent: this is an owner-tier tool
+        arg = args.strip()
+        if arg.lower() in ("stop", "cancel", "halt"):
+            if self._ping_running:
+                self._ping_stop = True
+                return await ctx.reply("🛑 Stopping the chain ping after the current one.")
+            return await ctx.reply("Nothing is being ping-chained right now.")
+        if not arg:
+            return await ctx.reply(
+                "Usage: `.ping <id … | @user … | @role … | role name | everyone>` · `.ping stop` to abort.")
+        if self._ping_running:
+            return await ctx.reply("A chain ping is already running — `.ping stop` first.")
+
+        guild = ctx.guild
+        # resolve targets -> ordered, de-duplicated member list (no bots)
+        want_everyone = False
+        role_ids: list[int] = []
+        member_ids: list[int] = []
+        unknown: list[str] = []
+        for tok in arg.split():
+            low = tok.lower()
+            if low in ("everyone", "all", "@everyone"):
+                want_everyone = True
+            elif m := re.fullmatch(r"<@!?(\d+)>", tok):
+                member_ids.append(int(m.group(1)))
+            elif m := re.fullmatch(r"<@&(\d+)>", tok):
+                role_ids.append(int(m.group(1)))
+            elif tok.isdigit():
+                rid = int(tok)
+                if guild.get_role(rid):
+                    role_ids.append(rid)
+                else:
+                    member_ids.append(rid)
+            else:
+                r = discord.utils.find(lambda x: x.name.lower() == low, guild.roles)
+                (role_ids.append(r.id) if r else unknown.append(tok))
+
+        seen: set[int] = set()
+        targets: list[discord.Member] = []
+
+        def add(mem):
+            if mem and not mem.bot and mem.id not in seen:
+                seen.add(mem.id)
+                targets.append(mem)
+
+        if want_everyone:
+            for mem in guild.members:
+                add(mem)
+        for rid in role_ids:
+            role = guild.get_role(rid)
+            if role:
+                for mem in role.members:
+                    add(mem)
+        for uid in member_ids:
+            add(guild.get_member(uid))
+
+        if not targets:
+            hint = f" (couldn't resolve: {', '.join(unknown)})" if unknown else ""
+            return await ctx.reply(f"No members matched.{hint}")
+
+        # confirm large runs (this fires a real notification to each person)
+        if len(targets) > 30:
+            warn = await ctx.reply(
+                f"⚠️ This will individually ping **{len(targets)}** members "
+                f"(~{len(targets) * 2}s). React ✅ within 60s to proceed, or ignore to cancel.")
+            await warn.add_reaction("✅")
+            try:
+                await self.bot.wait_for(
+                    "reaction_add", timeout=60,
+                    check=lambda r, u: u.id == ctx.author.id and str(r.emoji) == "✅" and r.message.id == warn.id)
+            except Exception:
+                return await warn.edit(content="Cancelled — no confirmation.")
+
+        self.bot.loop.create_task(self._run_ping(ctx.channel, targets, ctx.author))
+        await ctx.reply(f"📣 Chain-pinging **{len(targets)}** member(s) one by one. `.ping stop` to abort.")
+
+    async def _run_ping(self, channel, targets, actor):
+        import asyncio
+
+        self._ping_running = True
+        self._ping_stop = False
+        done = 0
+        try:
+            for mem in targets:
+                if self._ping_stop:
+                    break
+                for attempt in range(5):
+                    try:
+                        msg = await channel.send(mem.mention)
+                        await asyncio.sleep(1.2)          # let the notification land
+                        try:
+                            await msg.delete()
+                        except discord.HTTPException:
+                            pass
+                        done += 1
+                        break
+                    except discord.HTTPException as e:
+                        if getattr(e, "status", None) == 429:
+                            await asyncio.sleep(float(getattr(e, "retry_after", 3)) + 0.5)
+                        else:
+                            break
+                if done % 50 == 0 and done:
+                    await asyncio.sleep(1)  # gentle on the rate limiter
+        finally:
+            self._ping_running = False
+            stopped = self._ping_stop
+            self._ping_stop = False
+        try:
+            await channel.send(
+                f"📣 Chain ping {'stopped' if stopped else 'complete'}: notified **{done}** member(s).",
+                delete_after=60)
+        except discord.HTTPException:
+            pass
+        await self.send_log(mod_embed(
+            "📣 Chain Ping", f"{actor.mention} chain-pinged **{done}** member(s) in {channel.mention}"
+            + (" (stopped early)" if stopped else "") + ".", BLUE))
 
     @app_commands.command(name="slowmode", description="Set slowmode delay for this channel (seconds; 0 to disable).")
     @app_commands.default_permissions(manage_channels=True)
