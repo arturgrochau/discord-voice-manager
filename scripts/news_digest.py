@@ -66,6 +66,22 @@ SCHEMA = json.dumps({
     },
 })
 
+SECTION_RULES = """Section definitions — file every story in exactly ONE
+best-fitting section:
+- WORLD EVENTS: geopolitics OUTSIDE Europe — wars, diplomacy, elections and
+  crises in the US, Asia, Middle East, Africa, the Americas — prioritising
+  what affects Europe's position in the world.
+- EUROPE NEWS: politics and society INSIDE Europe — EU institutions,
+  national governments and elections, migration and borders, security and
+  policing, courts, protests, major social debates. European weather,
+  climate events and disasters belong HERE, never in econ-tech.
+- ECON & TECH: money and technology — markets, inflation, trade, energy
+  prices and supply, industry, corporate news, tech/AI regulation and
+  breakthroughs. A story qualifies only if its CORE subject is economic or
+  technological: a heatwave is not econ-tech; an energy-price spike caused
+  by one is.
+If a story does not clearly fit any section, DROP it entirely."""
+
 RESEARCH_PROMPT = """You are compiling today's ({date}) news digest for a
 European politics discussion server. The audience cares most about European
 sovereignty, EU and national politics, migration and border policy, security
@@ -107,20 +123,27 @@ desk for a European politics discussion server (audience: European
 sovereignty, EU/national politics, migration and borders, security/defence,
 energy independence, Europe's economy and tech standing).
 
-This check runs every 15 minutes, so ONLY report what is genuinely NEW:
-stories that broke or had a major development within roughly the LAST THREE
-HOURS. Run several live web and X searches now (news sites plus
-`site:x.com <keywords>` queries) to find them — do not answer from memory.
+This check runs every 15 minutes around the clock. ONLY report a story if a
+discrete, significant development happened within roughly the LAST 90
+MINUTES: an announcement, decision, resignation, attack, verdict, deal, or
+data release — a hard event with a timestamp. Run several live web and X
+searches now (news sites plus `site:x.com <keywords>` queries) — do not
+answer from memory.
 
-Write a short markdown list of AT MOST:
-- 2 WORLD EVENTS stories (global geopolitics affecting Europe's position)
-- 2 EUROPE NEWS stories (EU/national politics, migration, security)
-- 2 ECON & TECH stories (European economy, energy, industry, tech/AI policy)
+What does NOT count (drop without exception):
+- Continuing situations with no new hard event — a heatwave still ongoing, a
+  war still being fought, markets drifting. A FRESH TWEET ABOUT AN OLD STORY
+  IS NOT NEWS.
+- Anything substantially similar to a story in the already-covered list
+  below, even from a different outlet or with a different framing.
+- Colour pieces, explainers, interviews, previews, anniversaries, opinion.
 
-The bar is HIGH: breaking, significant, and fresh. It is completely fine —
-and expected on most runs — to report NOTHING for a section, or nothing at
-all. Say "no new stories" rather than padding with ongoing coverage that has
-no new development.
+{section_rules}
+
+Write a short markdown list of AT MOST 3 STORIES TOTAL across all sections,
+each labelled WORLD EVENTS / EUROPE NEWS / ECON & TECH. The bar is HIGH: on
+most runs the correct output is exactly "no new stories" — that is the
+expected result, not a failure. Never pad.
 
 For each story: a short factual headline, then every URL you actually saw in
 your search results — X status URLs (x.com/<account>/status/<id>) and article
@@ -142,6 +165,12 @@ Orbán, Wilders, Meloni) when they posted about a breaking story.
 
 STRUCTURE_PROMPT = """Convert the following researched news list into JSON.
 Sections: world_events (3 stories), europe_news (4), econ_tech (3).
+
+{section_rules}
+
+Re-check the researcher's filing against these definitions and move any
+misfiled story to its correct section.
+
 For each story: title; x_url = an X status URL present in the text verbatim
 (or "" if that story has none); article_url = an article URL present in the
 text verbatim (or "" if none). Copy URLs exactly — do not invent or repair
@@ -153,6 +182,13 @@ PULSE_STRUCTURE_PROMPT = """Convert the following researched news list into
 JSON. Sections: world_events, europe_news, econ_tech — each 0 to 2 stories,
 ONLY stories actually present in the text. If the text reports no new
 stories for a section, return an empty array for it — never invent stories.
+
+{section_rules}
+
+Re-check the researcher's filing against these definitions and move any
+misfiled story to its correct section (e.g. a European weather story
+labelled econ-tech belongs in europe_news). Drop stories fitting no section.
+
 For each story: title; x_url = an X status URL present in the text verbatim
 (or "" if that story has none); article_url = an article URL present in the
 text verbatim (or "" if none). Copy URLs exactly — do not invent or repair
@@ -164,10 +200,11 @@ log = logging.getLogger("news-digest")
 HISTORY_PATH = BASE_DIR / "digest_history.json"
 PULSE_STATE_PATH = BASE_DIR / "pulse_state.json"
 
-# pulse flood guards: at most this many posts across all sections per hour,
-# and per section per single pulse
-PULSE_HOURLY_CAP = 6
+# pulse flood guards: hourly across all sections, per section per pulse,
+# and total per single pulse run
+PULSE_HOURLY_CAP = 4
 PULSE_SECTION_CAP = 2
+PULSE_RUN_CAP = 3
 
 
 def pulse_recent_posts() -> list[float]:
@@ -184,15 +221,64 @@ def pulse_record_posts(n: int) -> None:
     PULSE_STATE_PATH.write_text(json.dumps(stamps))
 
 
-def load_history() -> list[str]:
+def load_history() -> list[dict]:
+    """Entries: {"u": url, "t": title, "ts": epoch}. Migrates the old
+    plain-URL format on read."""
     try:
-        return json.loads(HISTORY_PATH.read_text())
+        raw = json.loads(HISTORY_PATH.read_text())
     except Exception:
         return []
+    return [{"u": e, "t": "", "ts": 0} if isinstance(e, str) else e for e in raw]
 
 
-def save_history(urls: list[str]) -> None:
-    HISTORY_PATH.write_text(json.dumps(urls[-300:]))
+def save_history(entries: list[dict]) -> None:
+    HISTORY_PATH.write_text(json.dumps(entries[-300:]))
+
+
+def history_urls(history: list[dict]) -> set[str]:
+    return {e["u"] for e in history if e.get("u")}
+
+
+def recent_titles(history: list[dict], hours: int = 48) -> list[str]:
+    cutoff = time.time() - hours * 3600
+    return [e["t"] for e in history if e.get("t") and e.get("ts", 0) > cutoff]
+
+
+_STOPWORDS = {"the", "a", "an", "of", "to", "in", "on", "for", "and", "as",
+              "at", "by", "with", "after", "over", "amid", "its", "his",
+              "her", "new", "says", "say"}
+
+
+def _title_words(title: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9]+", title.lower())
+            if w not in _STOPWORDS and len(w) > 2}
+
+
+def similar_title(title: str, others: list[str], threshold: float = 0.5) -> str | None:
+    """Backstop dedup: same story re-reported under a rephrased headline."""
+    words = _title_words(title)
+    if not words:
+        return None
+    for other in others:
+        ow = _title_words(other)
+        if not ow:
+            continue
+        overlap = len(words & ow) / min(len(words), len(ow))
+        if overlap >= threshold:
+            return other
+    return None
+
+
+def build_skip_note(history: list[dict]) -> str:
+    titles = recent_titles(history)[-30:]
+    urls = list(history_urls(history))[-25:]
+    if not (titles or urls):
+        return ""
+    note = "ALREADY COVERED in the last 48 hours — do NOT re-report these stories (any outlet, any framing) unless there is a genuinely NEW hard development:\n"
+    note += "".join(f"- {t}\n" for t in titles)
+    if urls:
+        note += "Never re-use these URLs: " + " ".join(urls)
+    return note
 
 
 def setup_logging() -> None:
@@ -276,18 +362,15 @@ def gather(max_attempts: int = 3) -> dict:
     for attempt in range(1, max_attempts + 1):
         log.info("Digest attempt %d/%d: research phase", attempt, max_attempts)
         try:
-            recent = load_history()
-            skip_note = ""
-            if recent:
-                skip_note = ("Already covered recently (do NOT reuse these URLs or "
-                             "re-report the same stories): " + " ".join(recent[-40:]))
+            history = load_history()
             research_raw = run_grok(
                 RESEARCH_PROMPT.format(date=datetime.now().strftime("%A, %d %B %Y"),
-                                       skip_note=skip_note)
+                                       skip_note=build_skip_note(history))
             )
             research = extract_text_field(research_raw)
             log.info("Research phase returned %d chars; structuring", len(research))
-            data = parse_grok_output(run_grok(STRUCTURE_PROMPT.format(research=research), SCHEMA))
+            data = parse_grok_output(run_grok(
+                STRUCTURE_PROMPT.format(section_rules=SECTION_RULES, research=research), SCHEMA))
             validated = validate_stories(data)
             if all(validated.get(k) for k in CHANNELS):
                 return validated
@@ -301,25 +384,29 @@ def gather(max_attempts: int = 3) -> dict:
 
 def gather_pulse() -> dict:
     """One breaking-news sweep; empty results are normal, not an error."""
-    recent = load_history()
-    skip_note = ""
-    if recent:
-        skip_note = ("Already covered (do NOT reuse these URLs or re-report the "
-                     "same stories without a genuinely new development): "
-                     + " ".join(recent[-60:]))
+    history = load_history()
     now = datetime.now(timezone.utc)
     research_raw = run_grok(
         PULSE_RESEARCH_PROMPT.format(date=now.strftime("%A, %d %B %Y"),
                                      time=now.strftime("%H:%M"),
-                                     skip_note=skip_note)
+                                     section_rules=SECTION_RULES,
+                                     skip_note=build_skip_note(history))
     )
     research = extract_text_field(research_raw)
     log.info("Pulse research returned %d chars", len(research))
     if len(research) < 40 or "no new stories" in research.lower()[:200]:
         return {k: [] for k in CHANNELS}
-    data = parse_grok_output(run_grok(PULSE_STRUCTURE_PROMPT.format(research=research), SCHEMA))
+    data = parse_grok_output(run_grok(
+        PULSE_STRUCTURE_PROMPT.format(section_rules=SECTION_RULES, research=research), SCHEMA))
     validated = validate_stories(data)
-    return {k: v[:PULSE_SECTION_CAP] for k, v in validated.items()}
+    validated = {k: v[:PULSE_SECTION_CAP] for k, v in validated.items()}
+    # global per-run cap: quality over volume, whatever grok found
+    budget = PULSE_RUN_CAP
+    for k in CHANNELS:
+        take = min(budget, len(validated.get(k, [])))
+        validated[k] = validated.get(k, [])[:take]
+        budget -= take
+    return validated
 
 
 def validate_stories(data: dict) -> dict:
@@ -328,24 +415,33 @@ def validate_stories(data: dict) -> dict:
     Also dedupes across sections — grok sometimes files one story under two.
     """
     out: dict = {}
-    seen: set[str] = set(load_history())
+    history = load_history()
+    seen: set[str] = history_urls(history)
+    seen_titles: list[str] = recent_titles(history)
     for section in CHANNELS:
         kept = []
         for s in (data.get(section) or [])[:5]:
+            title = (s.get("title") or "").strip()
             x_url = (s.get("x_url") or "").strip()
             article = (s.get("article_url") or "").strip()
             if x_url in seen or (article and article in seen):
-                log.info("Deduped cross-section story: %s", s.get("title"))
+                log.info("Deduped by URL: %s", title)
+                continue
+            dup = similar_title(title, seen_titles)
+            if dup:
+                log.info("Deduped by title similarity: %r ~ %r", title, dup)
                 continue
             if X_URL_RE.match(x_url) and tweet_ok(x_url):
-                kept.append({"content": x_url})
-                seen.update({x_url, article} - {""})
+                kept.append({"content": x_url, "url": x_url, "title": title})
             elif article.startswith("http") and url_alive(article):
-                kept.append({"content": f"**{s.get('title', '').strip()}**\n{article}"})
-                seen.update({x_url, article} - {""})
+                kept.append({"content": f"**{title}**\n{article}",
+                             "url": article, "title": title})
             else:
                 log.warning("Dropped unvalidated story: %s (x=%s, article=%s)",
-                            s.get("title"), x_url or "-", article or "-")
+                            title, x_url or "-", article or "-")
+                continue
+            seen.update({x_url, article} - {""})
+            seen_titles.append(title)
         out[section] = kept
     return out
 
@@ -469,16 +565,20 @@ def main() -> None:
         total = sum(post_section(section, data[section], token)
                     for section in CHANNELS if data.get(section))
         if total:
-            posted_urls = [s["content"].split("\n")[-1] for sec in data.values() for s in sec]
-            save_history(load_history() + posted_urls)
+            now = time.time()
+            entries = [{"u": s["url"], "t": s["title"], "ts": now}
+                       for sec in data.values() for s in sec]
+            save_history(load_history() + entries)
             pulse_record_posts(total)
         log.info("Pulse complete: %d new stories.", total)
         return
 
     data = gather()
     total = sum(post_section(section, data[section], token) for section in CHANNELS)
-    posted_urls = [s["content"].split("\n")[-1] for sec in data.values() for s in sec]
-    save_history(load_history() + posted_urls)
+    now = time.time()
+    entries = [{"u": s["url"], "t": s["title"], "ts": now}
+               for sec in data.values() for s in sec]
+    save_history(load_history() + entries)
     if total == 0:
         sys.exit(1)
     log.info("Digest complete: %d stories.", total)
