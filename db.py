@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS detentions (
     moderator_id INTEGER,
     reason TEXT,
     detained_at TEXT NOT NULL,
-    released_at TEXT
+    released_at TEXT,
+    stripped_roles TEXT
 );
 CREATE TABLE IF NOT EXISTS sticky_mutes (
     guild_id INTEGER NOT NULL,
@@ -42,6 +43,11 @@ class Database:
     async def setup(self) -> None:
         async with aiosqlite.connect(self.path) as db:
             await db.executescript(SCHEMA)
+            # migrate older DBs that predate the stripped_roles column
+            cur = await db.execute("PRAGMA table_info(detentions)")
+            cols = {row[1] for row in await cur.fetchall()}
+            if "stripped_roles" not in cols:
+                await db.execute("ALTER TABLE detentions ADD COLUMN stripped_roles TEXT")
             await db.commit()
 
     # -- warnings ----------------------------------------------------------
@@ -71,21 +77,32 @@ class Database:
             return cur.rowcount
 
     # -- detentions --------------------------------------------------------
-    async def open_detention(self, guild_id: int, user_id: int, moderator_id: int | None, reason: str | None) -> None:
+    async def open_detention(self, guild_id: int, user_id: int, moderator_id: int | None,
+                             reason: str | None, stripped_roles: list[int] | None = None) -> None:
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
-                "INSERT INTO detentions (guild_id, user_id, moderator_id, reason, detained_at) VALUES (?,?,?,?,?)",
-                (guild_id, user_id, moderator_id, reason, utcnow()),
+                "INSERT INTO detentions (guild_id, user_id, moderator_id, reason, detained_at, stripped_roles) "
+                "VALUES (?,?,?,?,?,?)",
+                (guild_id, user_id, moderator_id, reason, utcnow(),
+                 ",".join(str(r) for r in (stripped_roles or [])) or None),
             )
             await db.commit()
 
-    async def close_detention(self, guild_id: int, user_id: int) -> None:
+    async def close_detention(self, guild_id: int, user_id: int) -> list[int]:
+        """Close the open detention and return the roles that were stripped."""
         async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT stripped_roles FROM detentions WHERE guild_id=? AND user_id=? AND released_at IS NULL "
+                "ORDER BY id DESC LIMIT 1", (guild_id, user_id))
+            row = await cur.fetchone()
             await db.execute(
                 "UPDATE detentions SET released_at=? WHERE guild_id=? AND user_id=? AND released_at IS NULL",
                 (utcnow(), guild_id, user_id),
             )
             await db.commit()
+        if row and row[0]:
+            return [int(r) for r in row[0].split(",") if r]
+        return []
 
     async def detention_history(self, guild_id: int, user_id: int) -> list[tuple]:
         async with aiosqlite.connect(self.path) as db:

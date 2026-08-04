@@ -139,13 +139,25 @@ class Moderation(commands.Cog):
         if role in member.roles:
             return await ctx.reply(f"ℹ️ {member.mention} is already detained.")
         self._suppress_role_log.add(member.id)
+        # Strip every removable role so no leftover role can grant channel
+        # access that the detained-deny overwrites don't cover. Managed roles
+        # (bot/integration/booster) and @everyone can't be removed; keep them.
+        strip = [r for r in member.roles
+                 if r != ctx.guild.default_role and not r.managed
+                 and r < ctx.guild.me.top_role and r != role]
         await member.add_roles(role, reason=f"Detained by {ctx.author}: {reason or 'no reason'}")
+        if strip:
+            try:
+                await member.remove_roles(*strip, reason="Detained — roles held for restoration")
+            except discord.HTTPException as e:
+                log.warning("Detain role-strip failed for %s: %s", member, e)
         if member.voice:
             try:
                 await member.move_to(None, reason="Detained — disconnected from voice")
             except discord.HTTPException:
                 pass
-        await self.bot.db.open_detention(ctx.guild.id, member.id, ctx.author.id, reason)
+        await self.bot.db.open_detention(ctx.guild.id, member.id, ctx.author.id, reason,
+                                         [r.id for r in strip])
         await ctx.reply(f"⛓️ {member.mention} has been detained.")
         await self.try_dm(member, f"You have been detained in **{ctx.guild.name}**.\nReason: {reason or 'not specified'}")
         await self.send_log(
@@ -167,7 +179,15 @@ class Moderation(commands.Cog):
             return await ctx.reply(f"ℹ️ {member.mention} is not detained.")
         self._suppress_role_log.add(member.id)
         await member.remove_roles(role, reason=f"Undetained by {ctx.author}: {reason or 'no reason'}")
-        await self.bot.db.close_detention(ctx.guild.id, member.id)
+        restored = await self.bot.db.close_detention(ctx.guild.id, member.id)
+        if restored:
+            give = [r for r in (ctx.guild.get_role(rid) for rid in restored)
+                    if r and r < ctx.guild.me.top_role and r not in member.roles]
+            if give:
+                try:
+                    await member.add_roles(*give, reason="Undetained — roles restored")
+                except discord.HTTPException as e:
+                    log.warning("Undetain role-restore failed for %s: %s", member, e)
         await ctx.reply(f"🕊️ {member.mention} has been released.")
         await self.try_dm(member, f"You have been released from detainment in **{ctx.guild.name}**.")
         await self.send_log(
