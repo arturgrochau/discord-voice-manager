@@ -243,6 +243,26 @@ class MusicPlayer:
     def _embed(self, text: str) -> discord.Embed:
         return discord.Embed(description=text, color=self.color)
 
+    def commands_embed(self, info_link: str = "") -> discord.Embed:
+        tail = f"\n📖 Full reference: {info_link}" if info_link else ""
+        return discord.Embed(
+            title="🎵 Music commands",
+            description=(
+                "**Start** — `..play <name or link>` (searches YouTube, links and "
+                "playlists work) · `..summon` pulls me into your channel\n"
+                "**Control** — `..skip` (also `..next`) · `..pause` · `..resume` · "
+                "`..stop` (leave)\n"
+                "**Queue** — `..queue` (also `..q`) shows what's up · `..np` current "
+                "track · `..shuffle` · `..clear`\n"
+                "**Sound** — `..vol <0-150>`\n"
+                + tail +
+                "\n-# ▶️ `..skip`/`..next` jump forward; `..queue`/`..q` just show the list."
+                "\n-# 💤 I leave on my own after 5 quiet minutes, or when everyone's gone."
+                "\n-# 🎁 Music channels earn no giveaway points."
+            ),
+            color=self.color,
+        )
+
     async def handle(self, message: discord.Message, cmd: str, arg: str) -> None:
         member = message.author
         self.text_channel = message.channel

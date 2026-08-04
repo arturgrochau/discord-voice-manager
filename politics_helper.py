@@ -288,10 +288,24 @@ class Helper(discord.Client):
         await self.contest.on_message(message)
         # ..music commands work from any chat; room commands only in room chats
         content = (message.content or "").strip()
-        if content.startswith("..") and not message.author.bot and self.music.enabled:
+        if content.startswith("..") and not message.author.bot:
             cmd, _, arg = content[2:].partition(" ")
-            if cmd.lower() in music_mod.COMMANDS:
-                await self.music.handle(message, cmd.lower(), arg.strip())
+            cmd = cmd.lower()
+            if cmd in ("commands", "cmds"):
+                embeds = []
+                if str(message.channel.id) in self.rooms.rooms:
+                    embeds.append(self.rooms.commands_embed())
+                if self.music.enabled:
+                    embeds.append(self.music.commands_embed(self.rooms._info_link()))
+                if embeds:
+                    try:
+                        await message.channel.send(embeds=embeds, delete_after=600)
+                        await message.delete(delay=15)
+                    except discord.HTTPException:
+                        pass
+                    return
+            if self.music.enabled and cmd in music_mod.COMMANDS:
+                await self.music.handle(message, cmd, arg.strip())
                 return
         # ..commands inside a temp room's chat
         if str(message.channel.id) in self.rooms.rooms and not message.author.bot:

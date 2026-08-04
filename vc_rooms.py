@@ -25,6 +25,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 import time
 from pathlib import Path
 
@@ -33,6 +34,41 @@ import discord
 log = logging.getLogger("politics-helper.rooms")
 
 BAN_DENY = discord.PermissionOverwrite(view_channel=False, connect=False)
+DEFAULT_BAN_MIN = 1440  # bans default to one day unless a length is given
+
+_DUR_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*([a-z]*)$")
+
+
+def parse_duration(text: str) -> int | None:
+    """'30m' / '6h' / '3d' / '2w' / '1mo' / '1y' / '45' (minutes) -> minutes.
+
+    'perm' (and friends) -> 0 (permanent, saved to prefs). None = unparsable.
+    """
+    t = text.strip().lower()
+    if t in ("perm", "permanent", "forever", "always", "0"):
+        return 0
+    m = _DUR_RE.match(t)
+    if not m:
+        return None
+    n, unit = float(m.group(1)), m.group(2)
+    if unit == "":
+        return max(1, int(n))  # bare number = minutes
+    for prefix, mult in (("mo", 43200), ("m", 1), ("h", 60), ("d", 1440),
+                         ("w", 10080), ("y", 525600)):
+        if unit.startswith(prefix):
+            return max(1, int(n * mult))
+    return None
+
+
+def fmt_span(minutes: int) -> str:
+    """1440 -> '1 day', 90 -> '1.5 hours', 30 -> '30 min'."""
+    for size, word in ((525600, "year"), (43200, "month"), (10080, "week"),
+                       (1440, "day"), (60, "hour")):
+        if minutes >= size:
+            n = round(minutes / size, 1)
+            n = int(n) if n == int(n) else n
+            return f"{n} {word}{'s' if n != 1 else ''}"
+    return f"{minutes} min"
 HUSH_DENY_KEY = "send_messages"
 MOD_ALLOW = discord.PermissionOverwrite(
     connect=True, mute_members=True, deafen_members=True)
@@ -63,6 +99,7 @@ class RoomManager:
         self.rooms_path = base_dir / "vc_rooms.json"
         self.minor_role_id = int(config.get("VC_MINOR_ROLE_ID", 0) or 0)
         self.rules_channel_id = int(config.get("RULES_CHANNEL_ID", 0) or 0)
+        self.info_channel_id = int(config.get("VC_INFO_CHANNEL_ID", 0) or 0)
         # per-server aesthetic (falls back to Discord blurple)
         self.color = int(str(config.get("PANEL_COLOR", "0x5865F2")), 16)
         self.emblem = config.get("PANEL_EMBLEM", "🔊")
@@ -148,6 +185,13 @@ class RoomManager:
                 if m:
                     await vc.set_permissions(m, overwrite=BAN_DENY, reason="Room ban (saved)")
                     state["bans"][str(uid)] = 0
+            for uid in p.get("hushed", []):
+                m = vc.guild.get_member(int(uid))
+                if m and m.id != owner.id:
+                    ow = discord.PermissionOverwrite()
+                    setattr(ow, HUSH_DENY_KEY, False)
+                    await vc.set_permissions(m, overwrite=ow, reason="Room hush (saved)")
+                    state["hushed"].append(int(uid))
             if p.get("locked"):
                 await self._apply_lock(vc, True)
                 state["locked"] = True
@@ -180,17 +224,23 @@ class RoomManager:
             saved["locked"] = state.get("locked", False)
             saved["voice_default"] = state.get("voice_default", True)
             saved["mods"] = state.get("mods", [])
+            saved["hushed"] = state.get("hushed", [])
             saved["bans"] = [int(u) for u, exp in state.get("bans", {}).items() if not exp]
         self._save()
 
     # -- panel -------------------------------------------------------------
 
+    def _info_link(self) -> str:
+        return f"<#{self.info_channel_id}>" if self.info_channel_id else "the info channel"
+
     def panel_embed(self, vc: discord.VoiceChannel, owner: discord.Member) -> discord.Embed:
         e = discord.Embed(
             description=(
                 f"### {self.emblem} {owner.mention} owns this room\n"
-                "Manage it with the buttons below, or type `..help` for chat commands.\n"
-                "-# ⚙️ Name · size · lock · mods · bans are remembered for your next room."
+                "Buttons below, `..commands` for the full list, "
+                f"every detail in {self._info_link()}.\n"
+                "-# ⚙️ Your setup (name, size, lock, mods, bans, hushes) is remembered.\n"
+                "-# 📜 Discord ToS applies everywhere in this server."
             ),
             color=self.color,
         )
@@ -199,30 +249,45 @@ class RoomManager:
         return e
 
     def owner_dm_embed(self, guild: discord.Guild) -> discord.Embed:
-        minors = " · `..nominors`" if self.minor_role_id else ""
         e = discord.Embed(
             title=f"{self.emblem} Your room in {guild.name}",
             description=(
-                "You own it — buttons are in the room chat, and every command "
-                "below works there too.\n\n"
-                "**Setup**\n"
-                "`..rename <name>` · `..status <text>` · `..setsize <0-99>`\n\n"
-                "**Access**\n"
-                f"`..lock` · `..voice` (speaking default){minors}\n\n"
-                "**People**\n"
-                "`..ban <@user> [minutes]` · `..unban <@user>` · `..bans`\n"
-                "`..mod <@user>` / `..demod <@user>` — trusted helpers\n"
-                "`..hush <@user>` / `..unhush <@user>` — chat-mute\n\n"
-                "**Ownership**\n"
-                "`..transfer <@user>` · `..abandon` — and `..claim` if an owner leaves\n\n"
-                "-# 💡 Right-click members in your room for native mute · deafen · move.\n"
-                "-# ⚙️ Your setup is saved and restored on your next room."
+                "You own it. Buttons live in the room chat; the essentials:\n\n"
+                "`..rename <name>` · `..setsize <0-99>` · `..lock` · `..voice`\n"
+                "`..ban <name> [30m|6h|3d|1mo|1y|perm]` — no length = **1 day**\n"
+                "`..mod` / `..unmod` · `..hush` / `..unhush` · `..kick` · `..unban`\n"
+                "`..transfer` · `..abandon` · `..claim`\n\n"
+                f"📖 Every command in full detail: {self._info_link()}\n"
+                "-# ⚙️ Everything you set is saved and restored on your next room.\n"
+                "-# 📜 Discord ToS applies. You never owe anyone a reason for a room "
+                "ban or mute, but punishing anyone over race, religion, gender, "
+                "sexuality or any protected trait is a server-rule violation."
             ),
             color=self.color,
         )
         if self.rules_channel_id:
             e.set_footer(text="Keep names and statuses within the server rules.")
         return e
+
+    def commands_embed(self) -> discord.Embed:
+        """The in-chat `..commands` card for room chats."""
+        minors = " · `..nominors`" if self.minor_role_id else ""
+        return discord.Embed(
+            title=f"{self.emblem} Room commands",
+            description=(
+                "**Setup** — `..rename <name>` · `..status <text>` · "
+                f"`..setsize <0-99>` · `..lock` · `..voice`{minors}\n"
+                "**Bans** — `..ban <name> [30m|6h|3d|2w|1mo|1y|perm]` "
+                "(no length = **1 day**) · `..unban <name>` · `..bans`\n"
+                "**People** — `..mod`/`..unmod` · `..hush`/`..unhush` · `..kick`\n"
+                "**Ownership** — `..transfer <name>` · `..abandon` · `..claim`\n"
+                "**Panel** — `..panel` re-posts the buttons\n\n"
+                f"📖 Full reference: {self._info_link()}\n"
+                "-# ⚙️ Names work with partial matches; mentions and ids too. "
+                "Mods, permanent bans and hushes stick for your future rooms."
+            ),
+            color=self.color,
+        )
 
     # -- primitives --------------------------------------------------------
 
@@ -363,7 +428,7 @@ class RoomManager:
         if member.guild_permissions.administrator:
             return "⛔ You can't room-ban a server admin."
         await vc.set_permissions(member, overwrite=BAN_DENY,
-                                 reason=f"Room ban by {actor}" + (f" ({minutes}m)" if minutes else ""))
+                                 reason=f"Room ban by {actor}" + (f" ({minutes}m)" if minutes else " (permanent)"))
         if member.voice and member.voice.channel and member.voice.channel.id == vc.id:
             try:
                 await member.move_to(None, reason="Room ban")
@@ -373,12 +438,13 @@ class RoomManager:
         if not minutes and member.id not in self.prefs.setdefault(str(state["owner"]), {}).setdefault("bans", []):
             self.prefs[str(state["owner"])]["bans"].append(member.id)
         self._save()
-        span = f" for {minutes} min" if minutes else ""
+        span = f" for {fmt_span(minutes)}" if minutes else ""
         await self._log(vc, f"{member.mention} was **room-banned**{span} by {actor.mention}.")
         await self._dm(member, f"🔨 You were banned from the voice room **{vc.name}**{span} "
                                f"by **{actor.display_name}** ({vc.guild.name}).")
         return (f"🔨 {member.mention} banned from this room"
-                + (f" for **{minutes} min**." if minutes else " (saved for your future rooms)."))
+                + (f" for **{fmt_span(minutes)}**." if minutes else
+                   " **permanently** (saved for your future rooms)."))
 
     async def act_unban(self, vc, actor, member: discord.Member) -> str:
         state = self.room(vc.id)
@@ -401,7 +467,7 @@ class RoomManager:
             return "Nobody is banned from this room. 🎉"
         lines = []
         for uid, exp in state["bans"].items():
-            left = f" — {max(0, int((exp - time.time()) / 60))} min left" if exp else " — permanent (saved)"
+            left = f" — {fmt_span(max(1, int((exp - time.time()) / 60)))} left" if exp else " — permanent (saved)"
             lines.append(f"• <@{uid}>{left}")
         return "**Room bans:**\n" + "\n".join(lines)
 
@@ -570,7 +636,7 @@ class RoomManager:
                 out = await self.act_rename(vc, actor, arg)
             elif cmd == "status" and arg:
                 out = await self.act_status(vc, actor, arg)
-            elif cmd in ("setsize", "size") and arg.split()[0].isdigit():
+            elif cmd in ("setsize", "size", "limit") and arg.split()[0].isdigit():
                 out = await self.act_size(vc, actor, int(arg.split()[0]))
             elif cmd == "lock":
                 out = await self.act_lock(vc, actor)
@@ -580,17 +646,28 @@ class RoomManager:
                 out = await self.act_nominors(vc, actor)
             elif cmd == "ban":
                 tokens = arg.split()
-                minutes = int(tokens[1]) if len(tokens) > 1 and tokens[1].isdigit() else 0
-                out = await need_member(self.act_ban, minutes)
+                minutes = DEFAULT_BAN_MIN
+                if len(tokens) > 1:
+                    parsed = parse_duration(tokens[1])
+                    if parsed is None:
+                        minutes = None
+                    else:
+                        minutes = parsed
+                if minutes is None:
+                    out = ("Couldn't read that ban length. Use `..ban <name> "
+                           "[30m | 6h | 3d | 2w | 1mo | 1y | perm]`. "
+                           "Plain numbers are minutes; no length means **1 day**.")
+                else:
+                    out = await need_member(self.act_ban, minutes)
             elif cmd == "unban":
                 out = await need_member(self.act_unban)
             elif cmd == "kick":
                 out = await need_member(self.act_kick)
-            elif cmd in ("bans", "displaybans", "display_bans"):
+            elif cmd in ("bans", "banlist", "displaybans", "display_bans"):
                 out = self.bans_text(vc)
             elif cmd == "mod":
                 out = await need_member(self.act_mod, True)
-            elif cmd == "demod":
+            elif cmd in ("demod", "unmod"):
                 out = await need_member(self.act_mod, False)
             elif cmd == "hush":
                 out = await need_member(self.act_hush, True)
@@ -602,7 +679,7 @@ class RoomManager:
                 out = await need_member(self.act_transfer)
             elif cmd == "abandon":
                 out = await self.act_abandon(vc, actor)
-            elif cmd == "help":
+            elif cmd in ("help", "panel"):
                 owner = message.guild.get_member((self.room(vc.id) or {}).get("owner", 0)) or actor
                 return await vc.send(embed=self.panel_embed(vc, owner), view=RoomPanel(self))
             else:
@@ -626,7 +703,7 @@ class _MemberAction(discord.ui.View):
     removes it (labels mark current state with ✓).
     """
 
-    def __init__(self, mgr: RoomManager, vc, action: str, minutes: int = 0):
+    def __init__(self, mgr: RoomManager, vc, action: str, minutes: int = DEFAULT_BAN_MIN):
         super().__init__(timeout=120)
         self.mgr, self.vc, self.action, self.minutes = mgr, vc, action, minutes
         state = mgr.room(vc.id) or {}
@@ -795,7 +872,8 @@ class RoomPanel(discord.ui.View):
             view = _MemberAction(self.mgr, vc, "ban")
             if view.empty:
                 return await interaction.response.send_message(
-                    "Nobody else is in the room — `..ban <name> [minutes]` works for anyone.", ephemeral=True)
+                    "Nobody else is in the room — `..ban <name> [30m|6h|3d|perm]` works "
+                    "for anyone, present or not (default 1 day).", ephemeral=True)
             await interaction.response.send_message(
                 "Ban who? (`..ban <name> 30` = 30-min ban, works for absent members too)",
                 view=view, ephemeral=True)
