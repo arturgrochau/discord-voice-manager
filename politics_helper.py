@@ -83,8 +83,10 @@ BUMP_XP = 200          # very generous: ~50 messages worth of XP
 REMINDER_TTL = 3 * 60 * 60   # general-chat reminder self-destructs after 3h
 AWARD_TTL = 24 * 60 * 60     # award announcements clean up after a day
 QUOTE_INTERVAL = 4 * 60 * 60
+BOOK_INTERVAL = 3 * 24 * 60 * 60   # a book recommendation every 3 days
 DEFAULT_NADEKO_DB = Path.home() / "Projects/nadekobot/nadeko-osx-arm64/data/NadekoBot.db"
 QUOTES_PATH = Path(__file__).resolve().parent / "philosophy_quotes.json"
+BOOK_RECS_PATH = Path(__file__).resolve().parent / "book_recs.json"
 
 
 class Helper(discord.Client):
@@ -154,6 +156,8 @@ class Helper(discord.Client):
             self.loop.create_task(self._bump_bootstrap())
         if self.general_channel_id and self.config.get("QUOTES_ENABLED", True):
             self.loop.create_task(self._quote_loop())
+        if int(self.config.get("BOOK_CLUB_CHANNEL_ID", 0) or 0) and self.config.get("BOOK_RECS_ENABLED", True):
+            self.loop.create_task(self._book_loop())
         if self.ladder and self.config.get("LADDER_MIN_RANK_DAYS"):
             self.loop.create_task(self._pending_promotions_loop())
         if self.ladder:
@@ -568,6 +572,63 @@ class Helper(discord.Client):
             except discord.HTTPException as e:
                 log.warning("Quote post failed: %s", e)
             await asyncio.sleep(QUOTE_INTERVAL)
+
+    # -- book club recommendations -----------------------------------------
+
+    async def _book_loop(self):
+        """Post a curated politics/philosophy book rec + discussion prompt to
+        the book-club channel every few days to seed activity. Restart-safe:
+        cycles through the list by reading which titles were posted recently."""
+        import asyncio
+        import random
+
+        try:
+            books = json.loads(BOOK_RECS_PATH.read_text())
+        except Exception:
+            log.exception("No book_recs file; book loop disabled")
+            return
+        channel_id = int(self.config.get("BOOK_CLUB_CHANNEL_ID", 0) or 0)
+        color = int(str(self.config.get("PANEL_COLOR", "0xC0A062")), 16)
+        emblem = self.config.get("PANEL_EMBLEM", "📚")
+
+        # restart-safe pacing: how long since our last rec actually posted
+        first_delay = 60
+        recent_titles: list[str] = []
+        channel = self.get_channel(channel_id)
+        if channel:
+            from datetime import datetime, timezone
+            try:
+                async for m in channel.history(limit=30):
+                    if m.author.id == self.user.id and m.embeds and (m.embeds[0].title or "").startswith("📚"):
+                        recent_titles.append((m.embeds[0].title or ""))
+                        if len(recent_titles) == 1:
+                            age = (datetime.now(timezone.utc) - m.created_at).total_seconds()
+                            first_delay = max(60, BOOK_INTERVAL - age)
+            except discord.HTTPException:
+                pass
+        await asyncio.sleep(first_delay)
+
+        while True:
+            channel = self.get_channel(channel_id)
+            if channel is None:
+                await asyncio.sleep(BOOK_INTERVAL)
+                continue
+            try:
+                pool = [b for b in books if not any(b["title"] in t for t in recent_titles[-8:])] or books
+                b = random.choice(pool)
+                recent_titles.append(f"📚 {b['title']}")
+                embed = discord.Embed(
+                    title=f"📚 Reading pick: {b['title']}",
+                    description=(f"*by {b['author']}*\n\n{b['blurb']}\n\n"
+                                 f"**💬 {b['prompt']}**"),
+                    color=color,
+                )
+                embed.set_footer(text="A fresh pick lands here every few days. Jump in with your take.")
+                await channel.send(embed=embed)
+                log.info("Posted book rec: %s", b["title"])
+            except discord.HTTPException as e:
+                log.warning("Book rec post failed: %s", e)
+            await asyncio.sleep(BOOK_INTERVAL)
 
     # -- contest event forwarding ------------------------------------------
 
