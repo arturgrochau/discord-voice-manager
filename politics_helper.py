@@ -822,6 +822,7 @@ class Helper(discord.Client):
             try:
                 vc = await guild.create_voice_channel(
                     name, category=category, overwrites=overwrites,
+                    bitrate=int(guild.bitrate_limit),  # best audio the tier allows
                     reason=f"Join-to-Create: room for {member}",
                 )
                 self.temp_vcs[vc.id] = time.monotonic()

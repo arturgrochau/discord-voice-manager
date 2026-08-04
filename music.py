@@ -136,6 +136,7 @@ class MusicPlayer:
             self._clear_state()
             return
         self._last_channel_id = ch.id
+        await self._maximize_channel(ch)
         log.info("Music restore: resuming %d track(s) in %s", len(self.queue), ch.name)
         if self.text_channel:
             try:
@@ -186,7 +187,10 @@ class MusicPlayer:
         def work():
             import yt_dlp
             want_dl = track.duration is not None and 0 < int(track.duration or 0) <= DOWNLOAD_MAX_SECONDS
-            opts = {"format": "bestaudio/best", "quiet": True, "no_warnings": True,
+            # webm-first: YouTube's opus streams (format 251, ~160 kbps VBR)
+            # beat the m4a/aac alternatives
+            opts = {"format": "bestaudio[ext=webm]/bestaudio/best",
+                    "quiet": True, "no_warnings": True,
                     "noplaylist": True, "socket_timeout": 15, "noprogress": True,
                     "retries": 3, "fragment_retries": 5}
             if want_dl:
@@ -241,8 +245,29 @@ class MusicPlayer:
             return "Couldn't connect to voice, try again in a moment."
         self._last_channel_id = target.id
         log.info("Voice connected: %s", target.name)
+        await self._maximize_channel(target)
         self._idle_since = time.monotonic()
         return None
+
+    async def _maximize_channel(self, ch) -> None:
+        """Raise the channel to the server's best bitrate; 64k default halves
+        what boosts already paid for."""
+        try:
+            limit = int(ch.guild.bitrate_limit)
+            if (ch.bitrate or 0) < limit:
+                await ch.edit(bitrate=limit, reason="Music: max audio quality")
+                log.info("Bitrate raised to %dkbps in %s", limit // 1000, ch.name)
+        except discord.HTTPException as e:
+            log.warning("Bitrate bump failed for %s: %s", ch, e)
+
+    def _encoder_opts(self) -> dict:
+        """Opus encoder tuned for music at the channel's full bitrate."""
+        kbps = 128
+        if self.voice and self.voice.is_connected():
+            kbps = max(64, min(510, (self.voice.channel.bitrate or 64000) // 1000))
+        return {"application": "audio", "signal_type": "music",
+                "bitrate": kbps, "bandwidth": "full",
+                "fec": True, "expected_packet_loss": 0.01}
 
     async def _disconnect(self, reason: str | None = None) -> None:
         if self.voice:
@@ -307,6 +332,7 @@ class MusicPlayer:
         except Exception as e:
             log.warning("Music watchdog: reconnect failed (%s), retrying next pass", e)
             return
+        await self._maximize_channel(ch)
         if self.current:
             self.queue.insert(0, self.current)
             self.current = None
@@ -366,7 +392,7 @@ class MusicPlayer:
                     fut.add_done_callback(lambda f: f.exception())
 
                 try:
-                    self.voice.play(src, after=after)
+                    self.voice.play(src, after=after, **self._encoder_opts())
                 except discord.ClientException as e:
                     log.warning("voice.play failed: %s", e)
                     self.current = None
