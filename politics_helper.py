@@ -114,10 +114,12 @@ class Helper(discord.Client):
         self.rooms.delete_cb = self._delete_temp
         self.contest = contest_mod.Contest(self, config, BASE_DIR, self.nadeko_db, self.guild_id)
         self.music = music_mod.MusicPlayer(self, config, BASE_DIR)
-        # AFK: continuously muted for this long -> moved to the AFK channel
+        # AFK: continuously muted, or alone in a call, for this long -> parked
         self.afk_channel_id = int(config.get("AFK_CHANNEL_ID", 0) or 0)
-        self.afk_after = int(config.get("AFK_AFTER_MINUTES", 120)) * 60
+        self.afk_after = int(config.get("AFK_AFTER_MINUTES", 180)) * 60
+        self.afk_alone_after = int(config.get("AFK_ALONE_MINUTES", 180)) * 60
         self._muted_since: dict[int, float] = {}
+        self._alone_since: dict[int, float] = {}
         # ordered low -> high; gaining a higher rung removes all lower ones
         self.ladder: list[int] = [int(r) for r in config.get("LADDER", [])]
         self._spawning: set[int] = set()  # members mid-room-creation (debounce)
@@ -863,6 +865,31 @@ class Helper(discord.Client):
                 if afk is None:
                     continue
                 now = time.time()
+
+                # alone tracking: sole human in a channel, any mute state
+                still_alone: set[int] = set()
+                for vc in guild.voice_channels:
+                    if vc.id in (self.afk_channel_id, self.trigger_id):
+                        continue
+                    humans = [m for m in vc.members if not m.bot]
+                    if len(humans) == 1:
+                        still_alone.add(humans[0].id)
+                        self._alone_since.setdefault(humans[0].id, now)
+                for uid in list(self._alone_since):
+                    if uid not in still_alone:
+                        self._alone_since.pop(uid)
+
+                async def park(member, why: str) -> None:
+                    try:
+                        await member.move_to(afk, reason=f"AFK: {why}")
+                        await self._try_dm(
+                            member,
+                            f"💤 You were moved to **{afk.name}** in **{guild.name}** "
+                            f"after {why}. Join any channel when you're back!")
+                        log.info("AFK-parked %s (%s)", member, why)
+                    except discord.HTTPException as e:
+                        log.warning("AFK move failed for %s: %s", member, e)
+
                 for uid, since in list(self._muted_since.items()):
                     if now - since < self.afk_after:
                         continue
@@ -875,15 +902,21 @@ class Helper(discord.Client):
                         self._muted_since.pop(uid, None)
                         continue
                     self._muted_since.pop(uid, None)
-                    try:
-                        await member.move_to(afk, reason=f"AFK: muted for {self.afk_after // 3600}h+")
-                        await self._try_dm(
-                            member,
-                            f"💤 You were moved to **{afk.name}** in **{guild.name}** after "
-                            f"{self.afk_after // 3600} hours muted. Join any channel when you're back!")
-                        log.info("AFK-parked %s (muted %.1fh)", member, (now - since) / 3600)
-                    except discord.HTTPException as e:
-                        log.warning("AFK move failed for %s: %s", member, e)
+                    self._alone_since.pop(uid, None)
+                    await park(member, f"{self.afk_after // 3600} hours muted")
+
+                for uid, since in list(self._alone_since.items()):
+                    if now - since < self.afk_alone_after:
+                        continue
+                    member = guild.get_member(uid)
+                    v = member.voice if member else None
+                    if (v is None or v.channel is None or v.channel.id == afk.id
+                            or len([m for m in v.channel.members if not m.bot]) != 1):
+                        self._alone_since.pop(uid, None)
+                        continue
+                    self._alone_since.pop(uid, None)
+                    self._muted_since.pop(uid, None)
+                    await park(member, f"{self.afk_alone_after // 3600} hours alone in a call")
             except Exception:
                 log.exception("AFK loop error")
 

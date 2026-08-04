@@ -171,8 +171,9 @@ def build_embeds(s: dict) -> list[dict]:
            "**🎵 Music** — `..play <name or link>` from any chat (also `..summon`, "
            "`..skip`, `..queue`, `..pause`, `..vol`, `..shuffle`, `..stop`). Auto-leaves "
            "when idle or alone. Music channels earn no giveaway points.\n"
-           "**💤 AFK parking** — mic muted for 2 h straight (not streaming) moves you "
-           "to 💤〡AFK, where nobody can speak. Leave or rejoin any channel to reset.\n"
+           "**💤 AFK parking** — muted 3 h straight (not streaming), or alone in a "
+           "call for 3 h, moves you to 💤〡AFK, where nobody can speak. Leave or "
+           "rejoin any channel to reset.\n"
            if s["extras"] else "")
         + "**🧹 Command hygiene** — Nadeko also deletes command invocations "
         "(`;delmsgoncmd` is on)."
