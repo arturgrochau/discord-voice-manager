@@ -113,7 +113,7 @@ class Helper(discord.Client):
         self.rooms = vc_rooms.RoomManager(self, config, BASE_DIR)
         self.rooms.delete_cb = self._delete_temp
         self.contest = contest_mod.Contest(self, config, BASE_DIR, self.nadeko_db, self.guild_id)
-        self.music = music_mod.MusicPlayer(self, config)
+        self.music = music_mod.MusicPlayer(self, config, BASE_DIR)
         # AFK: continuously muted for this long -> moved to the AFK channel
         self.afk_channel_id = int(config.get("AFK_CHANNEL_ID", 0) or 0)
         self.afk_after = int(config.get("AFK_AFTER_MINUTES", 120)) * 60

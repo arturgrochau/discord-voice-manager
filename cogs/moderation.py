@@ -1,6 +1,7 @@
 """Moderation: detain/undetain, bans, kicks, timeouts, purge, warnings, channel locks."""
 
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -354,38 +355,72 @@ class Moderation(commands.Cog):
 
     # -- channel tools -----------------------------------------------------
 
-    async def _do_purge(self, ctx_or_itx, channel, author, amount: int, member):
-        check = (lambda m: m.author.id == member.id) if member else (lambda m: True)
+    async def _do_purge(self, ctx_or_itx, channel, author, amount: int, member,
+                        text: str | None = None, negate: bool = False):
+        needle = (text or "").casefold()
+
+        def check(m):
+            if m.pinned:
+                return False  # pins are curated; never bulk-delete them
+            if member and m.author.id != member.id:
+                return False
+            if needle:
+                has = needle in (m.content or "").casefold()
+                return not has if negate else has
+            return True
+
         deleted = await channel.purge(limit=amount, check=check, reason=f"Purge by {author}")
+        detail = (f" (from {member.mention})" if member else "") \
+            + (f" ({'NOT ' if negate else ''}containing {text!r})" if text else "")
         await self.send_log(mod_embed("🧹 Messages Purged",
-                                      f"{len(deleted)} message(s) purged in {channel.mention} by {author.mention}"
-                                      + (f" (from {member.mention})" if member else "") + ".",
+                                      f"{len(deleted)} message(s) purged in {channel.mention} "
+                                      f"by {author.mention}{detail}.",
                                       BLUE))
         return len(deleted)
 
     @app_commands.command(name="purge", description="Delete the last N messages in this channel (max 100).")
-    @app_commands.describe(amount="How many messages", member="Only delete this member's messages")
+    @app_commands.describe(amount="How many messages to scan", member="Only delete this member's messages",
+                           contains="Only delete messages containing this text",
+                           not_contains="Only delete messages NOT containing this text")
     @app_commands.default_permissions(manage_messages=True)
-    async def purge_slash(self, interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100], member: discord.Member | None = None):
+    async def purge_slash(self, interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100],
+                          member: discord.Member | None = None,
+                          contains: str | None = None, not_contains: str | None = None):
         cap = self.prune_cap(interaction.user)
         if amount > cap:
             return await interaction.response.send_message(
                 f"⛔ Moderators can prune at most **{cap}** messages at a time.", ephemeral=True)
         await interaction.response.defer(ephemeral=True)
-        n = await self._do_purge(interaction, interaction.channel, interaction.user, amount, member)
+        text, negate = (not_contains, True) if not_contains else (contains, False)
+        n = await self._do_purge(interaction, interaction.channel, interaction.user,
+                                 amount, member, text, negate)
         await interaction.followup.send(f"🧹 Deleted {n} message(s).", ephemeral=True)
 
     @commands.command(name="purge", aliases=["prune", "p"])
     @staff_command()
-    async def purge_prefix(self, ctx: commands.Context,
-                           first: discord.Member | int,
-                           second: discord.Member | int | None = None):
-        """.prune N — delete last N messages; .prune @user N (either order) — only theirs."""
-        amount = next((a for a in (first, second) if isinstance(a, int)), None)
-        member = next((a for a in (first, second) if isinstance(a, discord.Member)), None)
-        if amount is None:
-            return await ctx.reply("Usage: `.prune N` or `.prune @user N`")
+    async def purge_prefix(self, ctx: commands.Context, *, args: str = ""):
+        """.p N | .p @user N | .p [N] "text" | .p [N] !"text" — any order.
+
+        A text filter deletes only messages containing it (or NOT containing
+        it with a leading !), case-insensitive, scanning the last N messages
+        (N defaults to your prune cap).
+        """
+        amount = None
+        member = None
+        rest: list[str] = []
+        for tok in args.split():
+            if amount is None and tok.isdigit():
+                amount = int(tok)
+            elif member is None and (m := re.fullmatch(r"<@!?(\d+)>", tok)):
+                member = ctx.guild.get_member(int(m.group(1)))
+            else:
+                rest.append(tok)
+        text = " ".join(rest).strip()
+        negate = text.startswith("!")
+        text = text.lstrip("!").strip().strip('"“”\'').strip() or None
         cap = self.prune_cap(ctx.author)
+        if amount is None:
+            amount = cap
         if amount > cap:
             return await ctx.reply(f"⛔ Moderators can prune at most **{cap}** messages at a time.")
         amount = max(1, min(100, amount))
@@ -393,8 +428,10 @@ class Moderation(commands.Cog):
             await ctx.message.delete()
         except discord.HTTPException:
             pass
-        n = await self._do_purge(ctx, ctx.channel, ctx.author, amount, member)
-        await ctx.send(f"🧹 Deleted {n} message(s).", delete_after=5)
+        n = await self._do_purge(ctx, ctx.channel, ctx.author, amount, member, text, negate)
+        what = (f" containing **{text}**" if text and not negate else
+                f" not containing **{text}**" if text else "")
+        await ctx.send(f"🧹 Deleted {n} message(s){what}.", delete_after=5)
 
     @app_commands.command(name="slowmode", description="Set slowmode delay for this channel (seconds; 0 to disable).")
     @app_commands.default_permissions(manage_channels=True)

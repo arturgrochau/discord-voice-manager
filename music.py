@@ -23,8 +23,10 @@ Design notes:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
+from pathlib import Path
 
 import discord
 
@@ -52,18 +54,20 @@ def _fmt_dur(seconds) -> str:
 
 
 class Track:
-    __slots__ = ("title", "url", "duration", "requester_id")
+    __slots__ = ("title", "url", "duration", "requester_id", "retried")
 
     def __init__(self, title, url, duration, requester_id):
         self.title = title
         self.url = url
         self.duration = duration
         self.requester_id = requester_id
+        self.retried = False  # one free retry when a stream dies mid-track
 
 
 class MusicPlayer:
-    def __init__(self, client: discord.Client, config: dict):
+    def __init__(self, client: discord.Client, config: dict, base_dir: Path | None = None):
         self.client = client
+        self.state_path = (base_dir or Path(".")) / "music_state.json"
         self.enabled = bool(config.get("MUSIC_ENABLED"))
         self.idle_seconds = int(config.get("MUSIC_IDLE_SECONDS", IDLE_SECONDS_DEFAULT))
         self.color = int(str(config.get("PANEL_COLOR", "0x5865F2")), 16)
@@ -81,6 +85,59 @@ class MusicPlayer:
         """Call from on_ready (the client loop doesn't exist at __init__)."""
         if self.enabled:
             self.client.loop.create_task(self._idle_loop())
+            self.client.loop.create_task(self._restore())
+
+    # -- restart survival --------------------------------------------------
+
+    def _save_state(self) -> None:
+        try:
+            tracks = ([self.current] if self.current else []) + self.queue
+            self.state_path.write_text(json.dumps({
+                "voice": self.channel_id,
+                "text": self.text_channel.id if self.text_channel else 0,
+                "volume": self.volume,
+                "queue": [[t.title, t.url, t.duration, t.requester_id] for t in tracks],
+            }))
+        except OSError:
+            pass
+
+    def _clear_state(self) -> None:
+        try:
+            self.state_path.write_text("{}")
+        except OSError:
+            pass
+
+    async def _restore(self) -> None:
+        """Pick a session back up after a restart killed it mid-track."""
+        try:
+            data = json.loads(self.state_path.read_text())
+        except Exception:
+            return
+        if not (data.get("voice") and data.get("queue")):
+            return
+        ch = self.client.get_channel(int(data["voice"]))
+        humans = [m for m in ch.members if not m.bot] if ch else []
+        if not humans:
+            self._clear_state()
+            return
+        self.text_channel = self.client.get_channel(int(data.get("text") or 0))
+        self.volume = float(data.get("volume", 1.0))
+        self.queue = [Track(*t) for t in data["queue"]]
+        try:
+            self.voice = await ch.connect(self_deaf=True)
+        except Exception as e:
+            log.warning("Music restore: reconnect failed: %s", e)
+            self._clear_state()
+            return
+        log.info("Music restore: resuming %d track(s) in %s", len(self.queue), ch.name)
+        if self.text_channel:
+            try:
+                await self.text_channel.send(
+                    embed=self._embed("🔁 Back after a restart, resuming the queue."),
+                    delete_after=60)
+            except discord.HTTPException:
+                pass
+        await self._advance()
 
     @property
     def channel_id(self) -> int:
@@ -159,6 +216,7 @@ class MusicPlayer:
         self.voice = None
         self.current = None
         self.queue.clear()
+        self._clear_state()
         if reason and self.text_channel:
             try:
                 await self.text_channel.send(
@@ -209,9 +267,13 @@ class MusicPlayer:
                     volume=self.volume)
                 self.current = track
 
-                def after(err, _self=self):
+                def after(err, _self=self, _track=track):
                     if err:
-                        log.warning("Playback error: %s", err)
+                        log.warning("Playback error on %r: %s", _track.title, err)
+                        if not _track.retried:
+                            # one retry: streams occasionally die mid-track
+                            _track.retried = True
+                            _self.queue.insert(0, _track)
                     _self.current = None
                     _self._idle_since = time.monotonic()
                     fut = asyncio.run_coroutine_threadsafe(_self._advance(), _self.client.loop)
@@ -223,6 +285,7 @@ class MusicPlayer:
                     log.warning("voice.play failed: %s", e)
                     self.current = None
                     continue
+                self._save_state()
                 if self.text_channel:
                     try:
                         await self.text_channel.send(
@@ -327,6 +390,7 @@ class MusicPlayer:
                 if self.current:
                     await say(f"{self.emblem} Queued **{info.get('title')}** "
                               f"(position {len(self.queue)}).")
+            self._save_state()
             if not self.current:
                 await self._advance()
             return
@@ -374,10 +438,12 @@ class MusicPlayer:
         elif cmd == "shuffle":
             import random
             random.shuffle(self.queue)
+            self._save_state()
             await say(f"🔀 Shuffled **{len(self.queue)}** queued tracks.")
         elif cmd == "clear":
             n = len(self.queue)
             self.queue.clear()
+            self._save_state()
             await say(f"🗑️ Cleared **{n}** queued tracks (current song keeps playing).")
         elif cmd in ("queue", "q"):
             lines = []
