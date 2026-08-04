@@ -148,6 +148,8 @@ class Helper(discord.Client):
             self.loop.create_task(self._quote_loop())
         if self.ladder and self.config.get("LADDER_MIN_RANK_DAYS"):
             self.loop.create_task(self._pending_promotions_loop())
+        if self.ladder:
+            self.loop.create_task(self._rank_reconcile_sweep(guild))
         await self.rooms.start()
         await self.contest.start()
         # every live room is delete-tracked, whatever it was renamed to
@@ -645,6 +647,44 @@ class Helper(discord.Client):
                 log.info("Promoted %s: removed %s", after, [r.name for r in lower])
             except discord.HTTPException as e:
                 log.warning("Ladder cleanup failed for %s: %s", after, e)
+
+    async def _rank_reconcile_sweep(self, guild):
+        """Heal rank state that drifted while the helper was offline.
+
+        Nadeko keeps granting XP roles whether or not we're up, and members
+        keep joining — so on startup: anyone holding several rungs keeps only
+        the highest (offline promotions stand; tenure gates apply live only),
+        Novice is stripped from ranked members, and rankless humans get it.
+        """
+        import asyncio
+
+        await asyncio.sleep(15)  # let the member cache finish chunking
+        rung_set = set(self.ladder)
+        novice = guild.get_role(self.autorole_id) if self.autorole_id else None
+        fixed = 0
+        for member in guild.members:
+            if member.bot or member.pending:
+                continue
+            held = [r for r in member.roles if r.id in rung_set]
+            try:
+                if held:
+                    top = max(held, key=lambda r: self.ladder.index(r.id))
+                    stale = [r for r in held if r != top]
+                    if novice and novice in member.roles:
+                        stale.append(novice)
+                    if stale:
+                        await member.remove_roles(
+                            *stale, reason="Rank sweep: superseded rank held from downtime")
+                        fixed += 1
+                elif novice and novice not in member.roles:
+                    await member.add_roles(
+                        novice, reason="Rank sweep: joined while helper was down")
+                    fixed += 1
+            except discord.HTTPException as e:
+                log.warning("Rank sweep failed for %s: %s", member, e)
+            if fixed and fixed % 10 == 0:
+                await asyncio.sleep(2)  # stay polite to the rate limiter
+        log.info("Rank sweep done: %d member(s) reconciled", fixed)
 
     async def _pending_promotions_loop(self):
         """Apply deferred promotions the moment their tenure is served."""
