@@ -106,6 +106,8 @@ class Helper(discord.Client):
         self._last_reward_at = 0.0
         self._reminder_msgs: list = []  # live reminder messages to clear on bump
         self.nadeko_db = Path(config.get("NADEKO_DB_PATH", DEFAULT_NADEKO_DB)).expanduser()
+        # everyone holds at least this role until their first ladder rank
+        self.autorole_id = int(config.get("AUTOROLE_ID", 0) or 0)
         # TempVoice-style room control (panel, ..commands, saved prefs)
         self.rooms = vc_rooms.RoomManager(self, config, BASE_DIR)
         self.rooms.delete_cb = self._delete_temp
@@ -533,6 +535,22 @@ class Helper(discord.Client):
 
     async def on_member_join(self, member):
         await self.contest.on_member_join(member)
+        # onboarding-gated members can't take roles yet; the pending->done
+        # flip in on_member_update covers them instead
+        if (self.autorole_id and member.guild.id == self.guild_id
+                and not member.bot and not member.pending):
+            await self._grant_autorole(member)
+
+    async def _grant_autorole(self, member):
+        role = member.guild.get_role(self.autorole_id)
+        if role is None or role in member.roles \
+                or any(r.id in self.ladder for r in member.roles):
+            return
+        try:
+            await member.add_roles(role, reason="Base rank: everyone starts as Novice")
+            log.info("Autorole: %s -> %s", role.name, member)
+        except discord.HTTPException as e:
+            log.warning("Autorole failed for %s: %s", member, e)
 
     async def on_member_remove(self, member):
         await self.contest.on_member_remove(member)
@@ -566,7 +584,12 @@ class Helper(discord.Client):
             return 0.0
 
     async def on_member_update(self, before, after):
-        if not self.ladder or after.guild.id != self.guild_id:
+        if after.guild.id != self.guild_id:
+            return
+        if (self.autorole_id and not after.bot
+                and before.pending and not after.pending):
+            await self._grant_autorole(after)
+        if not self.ladder:
             return
         before_ids = {r.id for r in before.roles}
         gained = [r for r in self.ladder if r in {x.id for x in after.roles} and r not in before_ids]
@@ -611,7 +634,10 @@ class Helper(discord.Client):
         state["since"].setdefault(uid, {})[str(top_role_id)] = _t.time()
         state["pending"].pop(uid, None)
         self._ladder_state_save(state)
-        lower = [after.guild.get_role(r) for r in self.ladder[:top]]
+        lower_ids = list(self.ladder[:top])
+        if self.autorole_id:
+            lower_ids.append(self.autorole_id)  # first rank supersedes Novice
+        lower = [after.guild.get_role(r) for r in lower_ids]
         lower = [r for r in lower if r and r in after.roles]
         if lower:
             try:

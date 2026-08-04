@@ -25,7 +25,7 @@ SERVERS = {
         "modmail_log": "#mod-log",
         "bans_log": "#bans",
         "detains_log": "#detains",
-        "ladder": ("Politics Junior 1 · Chancellor 5 · Archon 10 · Logothete 18 · "
+        "ladder": ("Novice 0 (given on join) · Politics Junior 1 · Chancellor 5 · Archon 10 · Logothete 18 · "
                    "Erudite 30 · Sovereign 45 · Imperator 65 · Supreme 90 · "
                    "Leviathan 120 · Mythical 150"),
         "extras": True,
