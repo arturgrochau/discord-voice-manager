@@ -142,7 +142,7 @@ class Helper(discord.Client):
 
         if self.bump_channel_id:
             self.loop.create_task(self._bump_bootstrap())
-        if self.general_channel_id:
+        if self.general_channel_id and self.config.get("QUOTES_ENABLED", True):
             self.loop.create_task(self._quote_loop())
         if self.ladder and self.config.get("LADDER_MIN_RANK_DAYS"):
             self.loop.create_task(self._pending_promotions_loop())

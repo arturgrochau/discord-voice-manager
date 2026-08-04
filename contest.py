@@ -40,7 +40,7 @@ import discord
 
 log = logging.getLogger("politics-helper.contest")
 
-MEDALS = ["🥇", "🥈", "🥉"]
+MEDALS = ["🥇", "🥈", "🥉", "🏅", "🏅"]  # top 5 all carry tangible prizes
 
 
 class Contest:
@@ -54,6 +54,8 @@ class Contest:
         self.invite_pts = int(cfg.get("INVITE_POINTS", 400))
         self.vc_pts = float(cfg.get("VC_POINTS_PER_MIN", 3))
         self.update_min = max(1, int(cfg.get("UPDATE_MINUTES", 10)))
+        # staff/alt accounts that must never appear on the board
+        self.exclude = {str(x) for x in cfg.get("EXCLUDE_IDS", [])}
         self.nadeko_db = nadeko_db
         self.guild_id = guild_id
         self.state_path = base_dir / "contest_state.json"
@@ -196,12 +198,16 @@ class Contest:
         uids = set(current) | set(self.state.get("invites", {})) | set(self.state.get("vc_seconds", {}))
         out = []
         for uid in uids:
-            xp = max(0, int(current.get(uid, 0)) - int(baseline.get(uid, 0)))
+            if uid in self.exclude:
+                continue
+            # deliberately unclamped: mods can push a score down with a
+            # negative .xpadd and the correction lands on the next render
+            xp = int(current.get(uid, 0)) - int(baseline.get(uid, 0))
             inv = self.state.get("invites", {}).get(uid, 0)
             vc_min = self.state.get("vc_seconds", {}).get(uid, 0) // 60
             msgs = self.state.get("messages", {}).get(uid, 0)
             pts = xp + inv * self.invite_pts + int(vc_min * self.vc_pts)
-            if pts > 0 or msgs > 0:
+            if pts > 0:
                 out.append((int(uid), pts, {"xp": xp, "inv": inv, "vc": vc_min, "msgs": msgs}))
         out.sort(key=lambda t: -t[1])
         return out
@@ -216,7 +222,12 @@ class Contest:
         ranked = self.scores()[:10]
         rows = []
         for i in range(10):
-            badge = MEDALS[i] if i < 3 else f"**{i + 1}.**"
+            if i < 3:
+                badge = MEDALS[i]
+            elif i < 5:
+                badge = f"{MEDALS[i]} **{i + 1}.**"
+            else:
+                badge = f"**{i + 1}.**"
             if i < len(ranked):
                 uid, pts, b = ranked[i]
                 bits = []
@@ -239,10 +250,13 @@ class Contest:
                 "• All XP you earn counts. Chat and voice both work, voice pays ~3x faster\n"
                 f"• Each friend you invite who stays: **+{self.invite_pts} pts**\n"
                 f"• Every minute unmuted in voice with others: **+{self.vc_pts:g} pts**\n\n"
-                "**Prizes**\n"
-                "🥇 1 month of Nitro + the **Mythical** role + gold medal\n"
-                "🥈 1 month of Nitro + **30,000 XP** + silver medal\n"
-                "🥉 1 month of Nitro + **15,000 XP** + bronze medal\n\n"
+                "**Prizes** (everyone in the top 10 wins XP)\n"
+                "🥇 1 month of Nitro + the **Mythical** role + **50,000 XP**\n"
+                "🥈 1 month of Nitro + **30,000 XP**\n"
+                "🥉 1 month of Nitro + **20,000 XP**\n"
+                "🏅 4th: **Nitro Basic** + **12,000 XP**\n"
+                "🏅 5th: **Nitro Basic** + **10,000 XP**\n"
+                "6th to 10th: **8,000 / 6,000 / 5,000 / 4,000 / 3,000 XP**\n\n"
                 "-# Anti-spam: only one message every 30 seconds counts.\n"
                 "-# Numbers look off? DM the bot and the mod team will adjust manually."
             ),
