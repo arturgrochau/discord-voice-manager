@@ -97,7 +97,9 @@ def spotify_tracks(url: str) -> tuple[str, list[tuple[str, int]]] | None:
         data = json.loads(mm.group(1))
     except json.JSONDecodeError:
         return None
-    name = _deep_find(data, "name") or "Spotify"
+    name = _deep_find(data, "name") or ""
+    if name in ("", "Page not found"):  # private / deleted / unreadable
+        return None
     track_list = _deep_find(data, "trackList") or []
     out: list[tuple[str, int]] = []
     if track_list:  # album or playlist
@@ -106,12 +108,11 @@ def spotify_tracks(url: str) -> tuple[str, list[tuple[str, int]]] | None:
             artist = (t.get("subtitle") or "").strip()
             if title:
                 out.append((f"{artist} {title}".strip(), int(t.get("duration") or 0)))
-    elif name and name != "Page not found":  # single track: entity is the song
+    elif kind == "track":  # single track: the entity itself is the song
         artist = _deep_find(data, "subtitle") or ""
         out.append((f"{artist} {name}".strip(), int(_deep_find(data, "duration") or 0)))
-    if name == "Page not found":
-        return None
-    return name, out
+    # album/playlist with no readable tracks => private or region-locked
+    return (name, out) if out else None
 
 
 def _fmt_dur(seconds) -> str:
@@ -556,8 +557,9 @@ class MusicPlayer:
                 resolved = await self.client.loop.run_in_executor(
                     None, spotify_tracks, arg)
                 if not resolved or not resolved[1]:
-                    await say("Couldn't read that Spotify link. Make sure the "
-                              "playlist is public, or paste a song/album link.")
+                    await say("Couldn't read that Spotify link. **Private playlists "
+                              "can't be read** — set it to public (Spotify: playlist "
+                              "→ ⋯ → Share → make public), or paste a song/album link.")
                     return
                 name, songs = resolved
                 room = min(len(songs), MAX_QUEUE - len(self.queue), PLAYLIST_CAP)
