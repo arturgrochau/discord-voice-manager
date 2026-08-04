@@ -172,8 +172,15 @@ class Contest:
                 if guild is None:
                     continue
                 changed = False
+                music_ch = getattr(getattr(self.client, "music", None), "channel_id", 0)
+                afk_ch = int(self.client.config.get("AFK_CHANNEL_ID", 0) or 0) \
+                    if hasattr(self.client, "config") else 0
                 for vc in guild.voice_channels:
                     if vc == guild.afk_channel:
+                        continue
+                    # no VC points while the music player sits in the channel
+                    # (music must not be a point farm), nor in the AFK room
+                    if vc.id in (music_ch, afk_ch):
                         continue
                     humans = [m for m in vc.members if not m.bot]
                     if len(humans) < 2:

@@ -36,6 +36,7 @@ import discord
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import vc_rooms  # noqa: E402  (TempVoice-style room control panel)
 import contest as contest_mod  # noqa: E402  (nitro giveaway engine)
+import music as music_mod  # noqa: E402  (..play music player)
 
 # HELPER_HOME lets other servers run their own instance off this codebase.
 BASE_DIR = Path(os.environ.get("HELPER_HOME", Path(__file__).resolve().parent))
@@ -112,6 +113,11 @@ class Helper(discord.Client):
         self.rooms = vc_rooms.RoomManager(self, config, BASE_DIR)
         self.rooms.delete_cb = self._delete_temp
         self.contest = contest_mod.Contest(self, config, BASE_DIR, self.nadeko_db, self.guild_id)
+        self.music = music_mod.MusicPlayer(self, config)
+        # AFK: continuously muted for this long -> moved to the AFK channel
+        self.afk_channel_id = int(config.get("AFK_CHANNEL_ID", 0) or 0)
+        self.afk_after = int(config.get("AFK_AFTER_MINUTES", 120)) * 60
+        self._muted_since: dict[int, float] = {}
         # ordered low -> high; gaining a higher rung removes all lower ones
         self.ladder: list[int] = [int(r) for r in config.get("LADDER", [])]
         self._spawning: set[int] = set()  # members mid-room-creation (debounce)
@@ -152,6 +158,9 @@ class Helper(discord.Client):
             self.loop.create_task(self._rank_reconcile_sweep(guild))
         await self.rooms.start()
         await self.contest.start()
+        self.music.start()
+        if self.afk_channel_id:
+            self.loop.create_task(self._afk_loop())
         # every live room is delete-tracked, whatever it was renamed to
         for cid in self.rooms.rooms:
             self.temp_vcs.setdefault(int(cid), time.monotonic())
@@ -277,6 +286,13 @@ class Helper(discord.Client):
                 await self._modmail_outbound(message)
             return
         await self.contest.on_message(message)
+        # ..music commands work from any chat; room commands only in room chats
+        content = (message.content or "").strip()
+        if content.startswith("..") and not message.author.bot and self.music.enabled:
+            cmd, _, arg = content[2:].partition(" ")
+            if cmd.lower() in music_mod.COMMANDS:
+                await self.music.handle(message, cmd.lower(), arg.strip())
+                return
         # ..commands inside a temp room's chat
         if str(message.channel.id) in self.rooms.rooms and not message.author.bot:
             await self.rooms.handle_message(message)
@@ -771,6 +787,7 @@ class Helper(discord.Client):
     async def on_voice_state_update(self, member, before, after):
         if member.bot:
             return
+        self._afk_track(member, after)
         # spawn a room (debounced: duplicate voice events arrive while moving)
         if after.channel and after.channel.id == self.trigger_id:
             if member.id in self._spawning:
@@ -802,6 +819,59 @@ class Helper(discord.Client):
                 self.loop.create_task(self._delayed_cleanup(before.channel.id))
                 return
             await self._delete_temp(before.channel)
+
+    # -- AFK parking -------------------------------------------------------
+    # Mic muted nonstop for AFK_AFTER_MINUTES -> parked in the AFK channel,
+    # where a channel overwrite denies Speak/Stream/Video for everyone.
+    # Streaming or camera-on counts as present, not AFK. The timer survives
+    # channel hops (still muted = still away) and resets on unmute/disconnect.
+
+    def _afk_track(self, member, state) -> None:
+        if not self.afk_channel_id:
+            return
+        away = (state.channel is not None
+                and state.channel.id != self.afk_channel_id
+                and (state.self_mute or state.mute or state.self_deaf or state.deaf)
+                and not (state.self_stream or state.self_video))
+        if away:
+            self._muted_since.setdefault(member.id, time.time())
+        else:
+            self._muted_since.pop(member.id, None)
+
+    async def _afk_loop(self):
+        import asyncio
+
+        while True:
+            await asyncio.sleep(60)
+            try:
+                guild = self.get_guild(self.guild_id)
+                afk = guild.get_channel(self.afk_channel_id) if guild else None
+                if afk is None:
+                    continue
+                now = time.time()
+                for uid, since in list(self._muted_since.items()):
+                    if now - since < self.afk_after:
+                        continue
+                    member = guild.get_member(uid)
+                    v = member.voice if member else None
+                    # re-check live state: the dict can lag a missed event
+                    if (v is None or v.channel is None or v.channel.id == afk.id
+                            or not (v.self_mute or v.mute or v.self_deaf or v.deaf)
+                            or v.self_stream or v.self_video):
+                        self._muted_since.pop(uid, None)
+                        continue
+                    self._muted_since.pop(uid, None)
+                    try:
+                        await member.move_to(afk, reason=f"AFK: muted for {self.afk_after // 3600}h+")
+                        await self._try_dm(
+                            member,
+                            f"💤 You were moved to **{afk.name}** in **{guild.name}** after "
+                            f"{self.afk_after // 3600} hours muted. Join any channel when you're back!")
+                        log.info("AFK-parked %s (muted %.1fh)", member, (now - since) / 3600)
+                    except discord.HTTPException as e:
+                        log.warning("AFK move failed for %s: %s", member, e)
+            except Exception:
+                log.exception("AFK loop error")
 
     async def _release_spawn(self, member_id: int):
         import asyncio
