@@ -131,6 +131,7 @@ class Helper(discord.Client):
         self.modmail_log_id = int(config.get("MODMAIL_LOG_CHANNEL_ID", 0) or 0)
         self.tickets: dict[int, int] = {}       # user id -> ticket channel id
         self.ticket_users: dict[int, int] = {}  # ticket channel id -> user id
+        self._streaks = self._streaks_load()    # daily login streaks
 
     async def on_ready(self):
         log.info("Politics helper online as %s (%s)", self.user, self.user.id)
@@ -262,8 +263,8 @@ class Helper(discord.Client):
             except discord.HTTPException:
                 pass
 
-    def _award_bump_xp(self, user_id: int, guild_id: int) -> int:
-        """Add BUMP_XP to the bumper's Nadeko server XP (WAL-safe upsert)."""
+    def _award_xp(self, user_id: int, guild_id: int, amount: int) -> int:
+        """Add `amount` to a member's Nadeko server XP (WAL-safe upsert)."""
         import sqlite3
 
         with sqlite3.connect(self.nadeko_db, timeout=10) as db:
@@ -271,13 +272,84 @@ class Helper(discord.Client):
                 "INSERT INTO UserXpStats (UserId, GuildId, Xp, DateAdded) "
                 "VALUES (?, ?, ?, datetime('now')) "
                 "ON CONFLICT(UserId, GuildId) DO UPDATE SET Xp = Xp + excluded.Xp",
-                (user_id, guild_id, BUMP_XP),
+                (user_id, guild_id, amount),
             )
             total = db.execute(
                 "SELECT Xp FROM UserXpStats WHERE UserId=? AND GuildId=?",
                 (user_id, guild_id),
             ).fetchone()[0]
         return total
+
+    def _award_bump_xp(self, user_id: int, guild_id: int) -> int:
+        return self._award_xp(user_id, guild_id, BUMP_XP)
+
+    # -- daily login streaks -----------------------------------------------
+    # A clear reason to show up every day: the first message a member sends
+    # on a new day extends their streak and pays escalating XP (with milestone
+    # bonuses). Miss a day and the streak resets — loss aversion does the work.
+
+    STREAK_MILESTONES = {7: 500, 14: 1200, 30: 3000, 60: 7000, 100: 15000, 365: 75000}
+
+    def _streaks_load(self) -> dict:
+        try:
+            return json.loads((BASE_DIR / "streaks.json").read_text())
+        except Exception:
+            return {}
+
+    def _streaks_save(self) -> None:
+        (BASE_DIR / "streaks.json").write_text(json.dumps(self._streaks))
+
+    async def _daily_streak(self, message) -> None:
+        if not self.config.get("STREAKS_ENABLED", False):
+            return
+        import asyncio
+        from datetime import date, timedelta
+
+        uid = str(message.author.id)
+        today = date.today().isoformat()
+        st = self._streaks.get(uid, {})
+        if st.get("last") == today:
+            return  # already counted for today
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        streak = st.get("streak", 0) + 1 if st.get("last") == yesterday else 1
+        best = max(st.get("best", 0), streak)
+        self._streaks[uid] = {"last": today, "streak": streak, "best": best}
+        self._streaks_save()
+
+        reward = min(50 + streak * 25, 1000) + self.STREAK_MILESTONES.get(streak, 0)
+        try:
+            await asyncio.to_thread(self._award_xp, message.author.id, message.guild.id, reward)
+        except Exception as e:
+            log.warning("Streak XP award failed for %s: %s", uid, e)
+            return
+        # celebrate milestones publicly (never the everyday case, to avoid spam)
+        if streak in self.STREAK_MILESTONES:
+            try:
+                await message.channel.send(
+                    f"🔥 {message.author.mention} just hit a **{streak}-day streak**! "
+                    f"+{reward:,} XP. Keep showing up.", delete_after=AWARD_TTL)
+            except discord.HTTPException:
+                pass
+
+    async def _show_streak(self, message) -> None:
+        st = self._streaks.get(str(message.author.id), {})
+        streak = st.get("streak", 0)
+        best = st.get("best", 0)
+        from datetime import date
+        counted_today = st.get("last") == date.today().isoformat()
+        nxt = next((m for m in sorted(self.STREAK_MILESTONES) if m > streak), None)
+        lines = [f"🔥 **{message.author.display_name}**'s streak: **{streak} day"
+                 f"{'s' if streak != 1 else ''}**  ·  best: {best}"]
+        lines.append("✅ Counted for today — see you tomorrow!" if counted_today
+                     else "-# Send a message any day to keep the streak alive.")
+        if nxt:
+            bonus = self.STREAK_MILESTONES[nxt]
+            lines.append(f"-# Next milestone: **{nxt} days** for a **+{bonus:,} XP** bonus "
+                         f"({nxt - streak} to go).")
+        try:
+            await message.channel.send("\n".join(lines), delete_after=60)
+        except discord.HTTPException:
+            pass
 
     async def on_message(self, message: discord.Message):
         import asyncio
@@ -292,12 +364,17 @@ class Helper(discord.Client):
                 await self._modmail_outbound(message)
             return
         await self.contest.on_message(message)
+        if not message.author.bot:
+            await self._daily_streak(message)
         # ..music commands work from any chat; room commands only in room chats
         content = (message.content or "").strip()
         # self-authored commands allowed: lets the operator drive the player
         # through the bot's own account for remote tests and DJ duty
         author_ok = (not message.author.bot
                      or (self.user and message.author.id == self.user.id))
+        if content.lower() in ("..streak", "..streaks", ".streak") and not message.author.bot:
+            await self._show_streak(message)
+            return
         if content.startswith("..") and author_ok:
             cmd, _, arg = content[2:].partition(" ")
             cmd = cmd.lower()
