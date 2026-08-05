@@ -372,11 +372,27 @@ class MusicPlayer:
             await asyncio.sleep(30)
             try:
                 self._purge_cache()
-                if not (self.voice and self.voice.is_connected()):
-                    # watchdog: a session with work left shouldn't be silent —
-                    # a dropped voice gateway gets reconnected and resumed
-                    if (self.current or self.queue) and self._last_channel_id:
+                # zombie-connection guard: if the channel we're bound to was
+                # deleted (temp rooms get remade constantly), the voice client
+                # can still report is_connected() while sending no audio. Treat
+                # a vanished channel as a drop and reconnect where listeners are.
+                bound = self.voice.channel.id if (self.voice and self.voice.channel) else 0
+                channel_gone = bound and self.client.get_channel(bound) is None
+                if not (self.voice and self.voice.is_connected()) or channel_gone:
+                    if channel_gone:
+                        log.warning("Music: bound channel %s vanished, tearing down zombie", bound)
+                        try:
+                            await self.voice.disconnect(force=True)
+                        except discord.HTTPException:
+                            pass
+                        self.voice = None
+                    if (self.current or self.queue) and self._last_channel_id \
+                            and self.client.get_channel(self._last_channel_id):
                         await self._watchdog_resume()
+                    elif channel_gone:  # nowhere valid to resume: stop cleanly
+                        self.current = None
+                        self.queue.clear()
+                        self._clear_state()
                     continue
                 humans = [m for m in self.voice.channel.members if not m.bot]
                 if not humans:
