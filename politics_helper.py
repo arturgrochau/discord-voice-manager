@@ -623,6 +623,35 @@ class Helper(discord.Client):
 
     # -- philosophy quotes -------------------------------------------------
 
+    async def _prune_bot_posts(self, channel, match, keep_newest: bool = False):
+        """Delete this bot's prior posts matching `match` so only one stands at
+        a time. With keep_newest, spare the single most recent match and return
+        that message (for pacing/variety); otherwise remove them all, return None."""
+        found = []
+        try:
+            async for m in channel.history(limit=300):
+                if m.author.id == self.user.id and match(m):
+                    found.append(m)
+        except discord.HTTPException:
+            return None
+        keep = found[0] if (keep_newest and found) else None  # history is newest-first
+        for m in found:
+            if keep is not None and m.id == keep.id:
+                continue
+            try:
+                await m.delete()
+            except discord.HTTPException:
+                pass
+        return keep
+
+    @staticmethod
+    def _is_quote_post(m) -> bool:
+        return bool(m.embeds) and (m.embeds[0].description or "").startswith("*“")
+
+    @staticmethod
+    def _is_book_post(m) -> bool:
+        return bool(m.embeds) and (m.embeds[0].title or "").startswith("📚")
+
     async def _quote_loop(self):
         import asyncio
         import random
@@ -633,21 +662,16 @@ class Helper(discord.Client):
             log.exception("No quotes file; quote loop disabled")
             return
         recent: list[int] = []
-        # restart-safe: figure out how long since our last quote actually posted
-        first_delay = QUOTE_INTERVAL
+        # single-quote policy: clear the backlog now, keep only the newest, and
+        # pace the next post from it (restart-safe, no churn on frequent restarts)
+        first_delay = 60
         channel = self.get_channel(self.general_channel_id)
         if channel:
             from datetime import datetime, timezone
-            try:
-                async for m in channel.history(limit=40):
-                    if m.author.id == self.user.id and m.embeds and (m.embeds[0].description or "").startswith("*“"):
-                        age = (datetime.now(timezone.utc) - m.created_at).total_seconds()
-                        first_delay = max(60, QUOTE_INTERVAL - age)
-                        break
-                else:
-                    first_delay = 60
-            except discord.HTTPException:
-                pass
+            newest = await self._prune_bot_posts(channel, self._is_quote_post, keep_newest=True)
+            if newest is not None:
+                age = (datetime.now(timezone.utc) - newest.created_at).total_seconds()
+                first_delay = max(60, QUOTE_INTERVAL - age)
         await asyncio.sleep(first_delay)
         while True:
             channel = self.get_channel(self.general_channel_id)
@@ -669,6 +693,7 @@ class Helper(discord.Client):
                     description=f"*“{q['text']}”*\n\n— **{q['author']}**",
                     color=0xC0A062,
                 )
+                await self._prune_bot_posts(channel, self._is_quote_post)  # retire the old one
                 await channel.send(embed=embed)
                 log.info("Posted quote by %s", q["author"])
             except discord.HTTPException as e:
@@ -693,21 +718,17 @@ class Helper(discord.Client):
         color = int(str(self.config.get("PANEL_COLOR", "0xC0A062")), 16)
         emblem = self.config.get("PANEL_EMBLEM", "📚")
 
-        # restart-safe pacing: how long since our last rec actually posted
+        # single-rec policy: keep only the newest pick standing; pace from it
         first_delay = 60
         recent_titles: list[str] = []
         channel = self.get_channel(channel_id)
         if channel:
             from datetime import datetime, timezone
-            try:
-                async for m in channel.history(limit=30):
-                    if m.author.id == self.user.id and m.embeds and (m.embeds[0].title or "").startswith("📚"):
-                        recent_titles.append((m.embeds[0].title or ""))
-                        if len(recent_titles) == 1:
-                            age = (datetime.now(timezone.utc) - m.created_at).total_seconds()
-                            first_delay = max(60, BOOK_INTERVAL - age)
-            except discord.HTTPException:
-                pass
+            keep = await self._prune_bot_posts(channel, self._is_book_post, keep_newest=True)
+            if keep is not None:
+                recent_titles.append(keep.embeds[0].title or "")
+                age = (datetime.now(timezone.utc) - keep.created_at).total_seconds()
+                first_delay = max(60, BOOK_INTERVAL - age)
         await asyncio.sleep(first_delay)
 
         while True:
@@ -726,6 +747,7 @@ class Helper(discord.Client):
                     color=color,
                 )
                 embed.set_footer(text="A fresh pick lands here every few days. Jump in with your take.")
+                await self._prune_bot_posts(channel, self._is_book_post)  # retire the old one
                 await channel.send(embed=embed)
                 log.info("Posted book rec: %s", b["title"])
             except discord.HTTPException as e:
@@ -738,7 +760,7 @@ class Helper(discord.Client):
     # older stragglers after downtime). One pinned explainer survives every
     # sweep so newcomers always have context. Restart-safe and idempotent.
 
-    ANICCA_MARKER = "anicca-notice"
+    ANICCA_TITLE = "⏳ anicca"
 
     async def _anicca_ensure_pin(self, channel) -> None:
         """Guarantee the permanent anicca notice is present and pinned."""
@@ -748,23 +770,18 @@ class Helper(discord.Client):
             return
         for m in pins:
             if (m.author.id == self.user.id and m.embeds
-                    and (m.embeds[0].footer.text or "") == self.ANICCA_MARKER):
+                    and (m.embeds[0].title or "").startswith(self.ANICCA_TITLE)):
                 return  # already there — nothing to do
         hrs = f"{self.anicca_retention / 3600:g}"
         color = int(str(self.config.get("PANEL_COLOR", "0xC0A062")), 16)
         embed = discord.Embed(
-            title="⏳ anicca — a channel that forgets",
+            title=self.ANICCA_TITLE,
             description=(
-                "***Anicca*** *(Pali: impermanence) — nothing here is meant to last.*\n\n"
-                f"Every message in this channel is **automatically cleared after {hrs} hours**. "
-                "Say what's on your mind, let it go, and don't expect it to still be here "
-                "tomorrow.\n\n"
-                "A space for fleeting thoughts, half-formed ideas, and talk that doesn't need a "
-                "permanent record. Only this pinned note stays."
+                "*Anicca* (Pali: impermanence).\n\n"
+                f"Every message in this channel is automatically cleared after {hrs} hours."
             ),
             color=color,
         )
-        embed.set_footer(text=self.ANICCA_MARKER)
         try:
             msg = await channel.send(embed=embed)
             await msg.pin(reason="anicca: permanent channel notice")
