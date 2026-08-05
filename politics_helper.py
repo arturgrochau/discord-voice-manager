@@ -142,6 +142,12 @@ class Helper(discord.Client):
         self.rules_channel_id = int(config.get("RULES_CHANNEL_ID", 0) or 0)
         self.book_club_channel_id = int(config.get("BOOK_CLUB_CHANNEL_ID", 0) or 0)
         self._welcomed: set[int] = set()
+        # role persistence: returning members keep their roles (ladder rank
+        # included). The detain role is deliberately excluded — the Sentinel bot
+        # is the sole detain authority and re-applies it from its DB on rejoin.
+        self.role_persist_enabled = config.get("ROLE_PERSIST_ENABLED", True)
+        self.detain_role_id = int(config.get("DETAIN_ROLE_ID", 0) or 0)
+        self._restored: set[int] = set()
 
     async def on_ready(self):
         log.info("Politics helper online as %s (%s)", self.user, self.user.id)
@@ -833,12 +839,67 @@ class Helper(discord.Client):
         await self.contest.on_member_join(member)
         # onboarding-gated members can't take roles yet; the pending->done
         # flip in on_member_update covers them instead
-        if (self.autorole_id and member.guild.id == self.guild_id
-                and not member.bot and not member.pending):
-            await self._grant_autorole(member)
+        if member.guild.id == self.guild_id and not member.bot and not member.pending:
+            await self._restore_roles(member)     # returning members keep roles
+            if self.autorole_id:
+                await self._grant_autorole(member)
         # welcome only once fully in (skip while onboarding-gated/pending)
         if not member.pending:
             await self._send_welcome(member)
+
+    # -- role persistence --------------------------------------------------
+    # Returning members keep the roles they left with (ladder rank included),
+    # so leaving/rejoining never wipes progress. Point totals persist anyway
+    # (Nadeko keys XP by user id). The detain role is excluded on purpose — the
+    # Sentinel bot re-applies detentions from its DB so they can't be dodged.
+
+    def _role_persist_load(self) -> dict:
+        try:
+            return json.loads((BASE_DIR / "role_persist.json").read_text())
+        except Exception:
+            return {}
+
+    def _role_persist_save(self, data: dict) -> None:
+        (BASE_DIR / "role_persist.json").write_text(json.dumps(data))
+
+    def _snapshot_roles(self, member) -> None:
+        if (not self.role_persist_enabled or member.bot
+                or member.guild.id != self.guild_id):
+            return
+        ids = [r.id for r in member.roles
+               if not r.is_default() and not r.managed and r.id != self.detain_role_id]
+        store = self._role_persist_load()
+        store[str(member.id)] = {"roles": ids, "ts": int(time.time())}
+        try:
+            self._role_persist_save(store)
+            log.info("Snapshotted %d role(s) for departing %s", len(ids), member)
+        except Exception as e:
+            log.warning("Role snapshot save failed for %s: %s", member, e)
+
+    async def _restore_roles(self, member) -> None:
+        if (not self.role_persist_enabled or member.bot
+                or member.guild.id != self.guild_id or member.id in self._restored):
+            return
+        rec = self._role_persist_load().get(str(member.id))
+        if not rec:
+            return
+        self._restored.add(member.id)
+        guild = member.guild
+        me = guild.me
+        roles = []
+        for rid in rec.get("roles", []):
+            role = guild.get_role(int(rid))
+            if (role and not role.is_default() and not role.managed
+                    and role.id != self.detain_role_id
+                    and (me is None or role < me.top_role)):
+                roles.append(role)
+        if not roles:
+            return
+        try:
+            await member.add_roles(*roles, reason="Role persistence: restored on rejoin")
+            log.info("Restored %d role(s) for returning %s", len(roles), member)
+        except discord.HTTPException as e:
+            log.warning("Role restore failed for %s: %s", member, e)
 
     async def _send_welcome(self, member) -> None:
         """A brief, self-deleting greeting from the bot. Concise (details live
@@ -856,7 +917,7 @@ class Helper(discord.Client):
             f"Welcome {member.mention} 👋  Glad to have you in "
             f"**Politics & Philosophy**. We're a Europe-centric community that's open "
             f"for discussion on politics, philosophy, and the ideas shaping our world. "
-            f"We value freedom of speech and focus on privacy here."
+            f"We value freedom of speech and a privacy-conscious culture."
         )
         if self.book_club_channel_id:
             msg += (f"\n\nFeel free to jump into a voice chat or create your own here, "
@@ -883,6 +944,7 @@ class Helper(discord.Client):
 
     async def on_member_remove(self, member):
         await self.contest.on_member_remove(member)
+        self._snapshot_roles(member)   # remember roles for a possible return
 
     async def on_invite_create(self, invite):
         await self.contest.on_invite_create(invite)
@@ -916,6 +978,7 @@ class Helper(discord.Client):
         if after.guild.id != self.guild_id:
             return
         if (not after.bot and before.pending and not after.pending):
+            await self._restore_roles(after)   # onboarding done -> restore roles
             if self.autorole_id:
                 await self._grant_autorole(after)
             await self._send_welcome(after)  # onboarding done -> greet now

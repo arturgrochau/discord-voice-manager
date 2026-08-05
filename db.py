@@ -104,6 +104,15 @@ class Database:
             return [int(r) for r in row[0].split(",") if r]
         return []
 
+    async def is_detained(self, guild_id: int, user_id: int) -> bool:
+        """True if the member has an open (unreleased) detention — used to
+        re-apply detain on rejoin so leaving/returning can't dodge it."""
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT 1 FROM detentions WHERE guild_id=? AND user_id=? AND released_at IS NULL LIMIT 1",
+                (guild_id, user_id))
+            return (await cur.fetchone()) is not None
+
     async def detention_history(self, guild_id: int, user_id: int) -> list[tuple]:
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute(

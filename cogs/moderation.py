@@ -1,5 +1,6 @@
 """Moderation: detain/undetain, bans, kicks, timeouts, purge, warnings, channel locks."""
 
+import asyncio
 import logging
 import re
 from datetime import datetime, timedelta, timezone
@@ -225,6 +226,50 @@ class Moderation(commands.Cog):
                 mod_embed("🕊️ User Released", f"{after.mention} was released (role removed).", GREEN, after.id),
                 self.detain_log,
             )
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member):
+        """Anti-bypass: a member who left while detained returns detained. The
+        detention is the source of truth (DB), so it survives leave/rejoin and
+        cannot be dodged. Runs after a short delay so the helper bot's role
+        restore lands first, then forces detained-only."""
+        if member.bot:
+            return
+        try:
+            still_detained = await self.bot.db.is_detained(member.guild.id, member.id)
+        except Exception:
+            log.exception("Detain-rejoin check failed for %s", member)
+            return
+        if not still_detained:
+            return
+        role = self.detain_role(member.guild)
+        if not role:
+            return
+        self._suppress_role_log.add(member.id)
+        await asyncio.sleep(4)  # let any role-restore from the helper settle
+        m = member.guild.get_member(member.id)
+        if m is None:
+            self._suppress_role_log.discard(member.id)
+            return
+        try:
+            if role not in m.roles:
+                await m.add_roles(role, reason="Re-detained on rejoin (anti-bypass)")
+            strip = [r for r in m.roles
+                     if r != m.guild.default_role and not r.managed
+                     and r < m.guild.me.top_role and r != role]
+            if strip:
+                await m.remove_roles(*strip, reason="Re-detained on rejoin — restrictions enforced")
+            log.info("Re-detained returning member %s", m)
+            await self.send_log(
+                mod_embed("⛓️ Re-detained on rejoin",
+                          f"{m.mention} rejoined while still detained — restrictions re-applied.",
+                          RED, m.id),
+                self.detain_log,
+            )
+        except discord.HTTPException as e:
+            log.warning("Re-detain on rejoin failed for %s: %s", m, e)
+        finally:
+            self._suppress_role_log.discard(member.id)
 
     @app_commands.command(name="detainhistory", description="Show a member's detention history.")
     @app_commands.default_permissions(manage_roles=True)
