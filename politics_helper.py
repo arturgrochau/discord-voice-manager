@@ -1008,6 +1008,9 @@ class Helper(discord.Client):
     async def on_member_remove(self, member):
         await self.contest.on_member_remove(member)
         self._snapshot_roles(member)   # remember roles for a possible return
+        # let a future return be welcomed and role-restored afresh
+        self._welcomed.discard(member.id)
+        self._restored.discard(member.id)
 
     async def on_invite_create(self, invite):
         await self.contest.on_invite_create(invite)
