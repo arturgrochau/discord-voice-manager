@@ -136,6 +136,12 @@ class Helper(discord.Client):
         self.anicca_channel_id = int(config.get("ANICCA_CHANNEL_ID", 0) or 0)
         self.anicca_retention = float(config.get("ANICCA_RETENTION_HOURS", 12) or 12) * 3600
         self.anicca_sweep = int(config.get("ANICCA_SWEEP_MINUTES", 30) or 30) * 60
+        # welcome: a short self-deleting greeting from the bot on join
+        self.welcome_enabled = config.get("WELCOME_ENABLED", True)
+        self.welcome_delete_after = int(config.get("WELCOME_DELETE_AFTER", 120) or 120)
+        self.rules_channel_id = int(config.get("RULES_CHANNEL_ID", 0) or 0)
+        self.book_club_channel_id = int(config.get("BOOK_CLUB_CHANNEL_ID", 0) or 0)
+        self._welcomed: set[int] = set()
 
     async def on_ready(self):
         log.info("Politics helper online as %s (%s)", self.user, self.user.id)
@@ -830,6 +836,43 @@ class Helper(discord.Client):
         if (self.autorole_id and member.guild.id == self.guild_id
                 and not member.bot and not member.pending):
             await self._grant_autorole(member)
+        # welcome only once fully in (skip while onboarding-gated/pending)
+        if not member.pending:
+            await self._send_welcome(member)
+
+    async def _send_welcome(self, member) -> None:
+        """A brief, self-deleting greeting from the bot. Concise (details live
+        in rules-and-info), not pushy, with a lowkey privacy note — the message
+        clearing itself is itself the nod. Fires once per member."""
+        if (not self.welcome_enabled or not self.general_channel_id
+                or member.bot or member.guild.id != self.guild_id
+                or member.id in self._welcomed):
+            return
+        channel = self.get_channel(self.general_channel_id)
+        if channel is None:
+            return
+        self._welcomed.add(member.id)
+        msg = (
+            f"Welcome {member.mention} 👋  Glad to have you in "
+            f"**Politics & Philosophy** — a Europe-centric home for open debate on "
+            f"politics, philosophy, and the ideas shaping our world. We value free "
+            f"speech and privacy here."
+        )
+        if self.book_club_channel_id:
+            msg += (f"\n\nJump into a voice chat when we're live, and check "
+                    f"<#{self.book_club_channel_id}> if you're into reading.")
+        else:
+            msg += "\n\nJump into a voice chat when we're live."
+        if self.rules_channel_id:
+            msg += (f"\n-# The essentials live in <#{self.rules_channel_id}> — and "
+                    f"this note clears itself shortly.")
+        else:
+            msg += "\n-# This note clears itself shortly."
+        try:
+            await channel.send(msg, delete_after=self.welcome_delete_after)
+            log.info("Welcomed %s", member)
+        except discord.HTTPException as e:
+            log.warning("Welcome failed for %s: %s", member, e)
 
     async def _grant_autorole(self, member):
         role = member.guild.get_role(self.autorole_id)
@@ -876,9 +919,10 @@ class Helper(discord.Client):
     async def on_member_update(self, before, after):
         if after.guild.id != self.guild_id:
             return
-        if (self.autorole_id and not after.bot
-                and before.pending and not after.pending):
-            await self._grant_autorole(after)
+        if (not after.bot and before.pending and not after.pending):
+            if self.autorole_id:
+                await self._grant_autorole(after)
+            await self._send_welcome(after)  # onboarding done -> greet now
         if not self.ladder:
             return
         before_ids = {r.id for r in before.roles}
