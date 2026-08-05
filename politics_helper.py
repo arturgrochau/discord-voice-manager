@@ -854,20 +854,16 @@ class Helper(discord.Client):
         self._welcomed.add(member.id)
         msg = (
             f"Welcome {member.mention} 👋  Glad to have you in "
-            f"**Politics & Philosophy** — a Europe-centric home for open debate on "
-            f"politics, philosophy, and the ideas shaping our world. We value free "
-            f"speech and privacy here."
+            f"**Politics & Philosophy**. We're a Europe-centric community that's open "
+            f"for discussion on politics, philosophy, and the ideas shaping our world. "
+            f"We value freedom of speech and focus on privacy here."
         )
         if self.book_club_channel_id:
-            msg += (f"\n\nJump into a voice chat when we're live, and check "
-                    f"<#{self.book_club_channel_id}> if you're into reading.")
+            msg += (f"\n\nFeel free to jump into a voice chat or create your own here, "
+                    f"and check out <#{self.book_club_channel_id}> if you have book "
+                    f"recommendations or you're into reading and discussing books.")
         else:
-            msg += "\n\nJump into a voice chat when we're live."
-        if self.rules_channel_id:
-            msg += (f"\n-# The essentials live in <#{self.rules_channel_id}> — and "
-                    f"this note clears itself shortly.")
-        else:
-            msg += "\n-# This note clears itself shortly."
+            msg += "\n\nFeel free to jump into a voice chat or create your own here."
         try:
             await channel.send(msg, delete_after=self.welcome_delete_after)
             log.info("Welcomed %s", member)
