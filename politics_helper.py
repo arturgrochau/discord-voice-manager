@@ -816,7 +816,14 @@ class Helper(discord.Client):
                 body = (f"{p['prompt']}\n\n"
                         f"-# Share your take below — or start your own thread with a "
                         f"question you've been chewing on. This is the place for it.")
-                await forum.create_thread(name=p["title"][:100], content=body)
+                # this forum requires a tag on every post
+                by_name = {t.name.lower(): t for t in forum.available_tags}
+                tag = next((by_name[n] for n in (p.get("tag", "").lower(),
+                            "philosophy-general", "politics-general") if n in by_name), None)
+                if tag is None and forum.available_tags:
+                    tag = forum.available_tags[0]
+                await forum.create_thread(name=p["title"][:100], content=body,
+                                          applied_tags=[tag] if tag else [])
                 log.info("Posted philosophy forum prompt: %s", p["title"])
             except discord.HTTPException as e:
                 log.warning("Forum prompt failed: %s", e)
