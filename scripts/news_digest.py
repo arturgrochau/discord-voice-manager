@@ -162,11 +162,19 @@ story. Also skip pure opinion/explainers/anniversaries; report events.
 {section_rules}
 
 Write a short markdown list of your 2-3 picks, each labelled WORLD EVENTS /
-EUROPE NEWS / ECON & TECH. For each: a short factual headline, then every URL
-you actually saw in your search results — X status URLs
-(x.com/<account>/status/<id>) and the article URL. Copy URLs
-character-for-character from results; NEVER write a URL you did not see. If no
-strong X post exists for a story, give the article URL and say so.
+EUROPE NEWS / ECON & TECH. For each: a short factual headline, then the URLs
+you actually saw in your search results. ALWAYS include the primary-source
+ARTICLE URL from a reputable outlet — that is the link that gets posted.
+Include an X status URL (x.com/<account>/status/<id>) only as a secondary
+reference, or as the sole link when the post itself is the primary/breaking
+source and no article exists yet. Copy URLs character-for-character from
+results; NEVER write a URL you did not see.
+
+Source diversity is REQUIRED: do not source most picks from the same
+publication or the same platform. Spread them across different reputable
+outlets (e.g. Reuters, AP, AFP, Bloomberg, FT, BBC, the Guardian, Politico
+Europe, Euronews, DW, Al Jazeera, Le Monde) — never lean on one outlet, or on
+X, for everything.
 
 X post quality bar (strict): ENGLISH-language posts only, from major
 high-follower news/commentary accounts such as: elonmusk, Reuters, AFP,
@@ -426,8 +434,23 @@ def gather_pulse() -> dict:
     return validated
 
 
+def _domain(url: str) -> str:
+    """Bare registrable-ish host for source-diversity accounting."""
+    try:
+        return urllib.parse.urlparse(url).netloc.lower().replace("www.", "")
+    except Exception:
+        return ""
+
+
 def validate_stories(data: dict) -> dict:
-    """Keep only stories whose tweet or article URL verifiably exists.
+    """Keep only stories whose article (preferred) or tweet URL verifiably
+    exists, sourced from a diverse spread of outlets.
+
+    Source policy: prefer the reputable-outlet ARTICLE over the raw X post so
+    the feed is sourced from varied publications rather than dominated by X;
+    fall back to the tweet only when a story has no usable article (breaking
+    news where the post itself is the primary source). A per-run per-domain cap
+    stops any single outlet (X included) flooding one run.
 
     Also dedupes across sections — grok sometimes files one story under two.
     """
@@ -435,6 +458,9 @@ def validate_stories(data: dict) -> dict:
     history = load_history()
     seen: set[str] = history_urls(history)
     seen_titles: list[str] = recent_titles(history)
+    # source diversity: at most this many items from one outlet domain per run
+    run_domains: dict[str, int] = {}
+    PER_DOMAIN_RUN_CAP = 2
     for section in CHANNELS:
         kept = []
         for s in (data.get(section) or [])[:5]:
@@ -448,15 +474,33 @@ def validate_stories(data: dict) -> dict:
             if dup:
                 log.info("Deduped by title similarity: %r ~ %r", title, dup)
                 continue
-            if X_URL_RE.match(x_url) and tweet_ok(x_url):
-                kept.append({"content": x_url, "url": x_url, "title": title})
-            elif article.startswith("http") and url_alive(article):
-                kept.append({"content": f"**{title}**\n{article}",
-                             "url": article, "title": title})
-            else:
-                log.warning("Dropped unvalidated story: %s (x=%s, article=%s)",
-                            title, x_url or "-", article or "-")
+            # Prefer a reputable-outlet article; fall back to the tweet only
+            # when there is no usable article (post = primary/breaking source).
+            article_ok = article.startswith("http") and url_alive(article)
+            tweet_valid = bool(X_URL_RE.match(x_url)) and tweet_ok(x_url)
+            candidates = []
+            if article_ok:
+                candidates.append(("article", article, _domain(article)))
+            if tweet_valid:
+                candidates.append(("tweet", x_url, "x.com"))
+            # honour the per-run diversity cap; try the alternate source if the
+            # preferred one's outlet is already saturated for this run
+            choice = None
+            for kind, url, dom in candidates:
+                if run_domains.get(dom, 0) < PER_DOMAIN_RUN_CAP:
+                    choice = (kind, url, dom)
+                    break
+            if choice is None:
+                if candidates:
+                    log.info("Diversity cap: skipped saturated-source story: %s", title)
+                else:
+                    log.warning("Dropped unvalidated story: %s (x=%s, article=%s)",
+                                title, x_url or "-", article or "-")
                 continue
+            kind, url, dom = choice
+            content = url if kind == "tweet" else f"**{title}**\n{url}"
+            kept.append({"content": content, "url": url, "title": title})
+            run_domains[dom] = run_domains.get(dom, 0) + 1
             seen.update({x_url, article} - {""})
             seen_titles.append(title)
         out[section] = kept
