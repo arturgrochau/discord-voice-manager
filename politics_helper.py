@@ -84,9 +84,11 @@ REMINDER_TTL = 3 * 60 * 60   # general-chat reminder self-destructs after 3h
 AWARD_TTL = 24 * 60 * 60     # award announcements clean up after a day
 QUOTE_INTERVAL = 4 * 60 * 60
 BOOK_INTERVAL = 3 * 24 * 60 * 60   # a book recommendation every 3 days
+FORUM_PROMPT_INTERVAL = 3 * 24 * 60 * 60   # a philosophy-forum prompt every 3 days
 DEFAULT_NADEKO_DB = Path.home() / "Projects/nadekobot/nadeko-osx-arm64/data/NadekoBot.db"
 QUOTES_PATH = Path(__file__).resolve().parent / "philosophy_quotes.json"
 BOOK_RECS_PATH = Path(__file__).resolve().parent / "book_recs.json"
+PHIL_PROMPTS_PATH = Path(__file__).resolve().parent / "philosophy_prompts.json"
 
 
 class Helper(discord.Client):
@@ -175,6 +177,8 @@ class Helper(discord.Client):
             self.loop.create_task(self._quote_loop())
         if int(self.config.get("BOOK_CLUB_CHANNEL_ID", 0) or 0) and self.config.get("BOOK_RECS_ENABLED", True):
             self.loop.create_task(self._book_loop())
+        if int(self.config.get("PHILOSOPHY_FORUM_CHANNEL_ID", 0) or 0) and self.config.get("FORUM_PROMPTS_ENABLED", True):
+            self.loop.create_task(self._forum_loop())
         if self.ladder and self.config.get("LADDER_MIN_RANK_DAYS"):
             self.loop.create_task(self._pending_promotions_loop())
         if self.ladder:
@@ -765,6 +769,58 @@ class Helper(discord.Client):
             except discord.HTTPException as e:
                 log.warning("Book rec post failed: %s", e)
             await asyncio.sleep(BOOK_INTERVAL)
+
+    # -- philosophy forum prompts ------------------------------------------
+    # Seeds the philosophy forum with a fresh discussion prompt every few days:
+    # gives newcomers something to jump into, keeps posts from all archiving
+    # out of the default view, and nudges people to create/debate topics.
+    # Restart-safe: paces the next prompt from the newest one still active.
+
+    async def _forum_loop(self):
+        import asyncio
+        import random
+
+        try:
+            prompts = json.loads(PHIL_PROMPTS_PATH.read_text())
+        except Exception:
+            log.exception("No philosophy prompts file; forum loop disabled")
+            return
+        channel_id = int(self.config.get("PHILOSOPHY_FORUM_CHANNEL_ID", 0) or 0)
+
+        first_delay = 60
+        recent_titles: list[str] = []
+        forum = self.get_channel(channel_id)
+        if isinstance(forum, discord.ForumChannel):
+            from datetime import datetime, timezone
+            newest = None
+            for t in forum.threads:
+                if t.owner_id == self.user.id:
+                    recent_titles.append(t.name)
+                    if t.created_at and (newest is None or t.created_at > newest):
+                        newest = t.created_at
+            if newest is not None:
+                age = (datetime.now(timezone.utc) - newest).total_seconds()
+                first_delay = max(60, FORUM_PROMPT_INTERVAL - age)
+        await asyncio.sleep(first_delay)
+
+        while True:
+            forum = self.get_channel(channel_id)
+            if not isinstance(forum, discord.ForumChannel):
+                await asyncio.sleep(FORUM_PROMPT_INTERVAL)
+                continue
+            try:
+                pool = [p for p in prompts
+                        if not any(p["title"] == t for t in recent_titles[-10:])] or prompts
+                p = random.choice(pool)
+                recent_titles.append(p["title"])
+                body = (f"{p['prompt']}\n\n"
+                        f"-# Share your take below — or start your own thread with a "
+                        f"question you've been chewing on. This is the place for it.")
+                await forum.create_thread(name=p["title"][:100], content=body)
+                log.info("Posted philosophy forum prompt: %s", p["title"])
+            except discord.HTTPException as e:
+                log.warning("Forum prompt failed: %s", e)
+            await asyncio.sleep(FORUM_PROMPT_INTERVAL)
 
     # -- anicca: the channel that forgets ----------------------------------
     # A rolling ephemeral channel. Messages older than the retention window
