@@ -132,6 +132,10 @@ class Helper(discord.Client):
         self.tickets: dict[int, int] = {}       # user id -> ticket channel id
         self.ticket_users: dict[int, int] = {}  # ticket channel id -> user id
         self._streaks = self._streaks_load()    # daily login streaks
+        # anicca: an ephemeral channel that forgets on a rolling window
+        self.anicca_channel_id = int(config.get("ANICCA_CHANNEL_ID", 0) or 0)
+        self.anicca_retention = float(config.get("ANICCA_RETENTION_HOURS", 12) or 12) * 3600
+        self.anicca_sweep = int(config.get("ANICCA_SWEEP_MINUTES", 30) or 30) * 60
 
     async def on_ready(self):
         log.info("Politics helper online as %s (%s)", self.user, self.user.id)
@@ -168,6 +172,8 @@ class Helper(discord.Client):
         self.music.start()
         if self.afk_channel_id:
             self.loop.create_task(self._afk_loop())
+        if self.anicca_channel_id and self.config.get("ANICCA_ENABLED", True):
+            self.loop.create_task(self._anicca_loop())
         # every live room is delete-tracked, whatever it was renamed to
         for cid in self.rooms.rooms:
             self.temp_vcs.setdefault(int(cid), time.monotonic())
@@ -351,6 +357,22 @@ class Helper(discord.Client):
         except discord.HTTPException:
             pass
 
+    async def _show_anicca(self, message) -> None:
+        """Explain the ephemeral channel on demand (this reply is swept too)."""
+        hrs = f"{self.anicca_retention / 3600:g}"
+        if self.anicca_channel_id and message.channel.id == self.anicca_channel_id:
+            txt = (f"⏳ This is **anicca** — messages here are auto-cleared after "
+                   f"**{hrs} hours**. Speak freely; nothing lingers. (The pinned note stays.)")
+        elif self.anicca_channel_id:
+            txt = (f"⏳ **anicca** (<#{self.anicca_channel_id}>) is an ephemeral channel — "
+                   f"messages there are auto-cleared after **{hrs} hours**.")
+        else:
+            txt = "⏳ No ephemeral channel is configured."
+        try:
+            await message.channel.send(txt, delete_after=120)
+        except discord.HTTPException:
+            pass
+
     async def on_message(self, message: discord.Message):
         import asyncio
 
@@ -374,6 +396,9 @@ class Helper(discord.Client):
                      or (self.user and message.author.id == self.user.id))
         if content.lower() in ("..streak", "..streaks", ".streak") and not message.author.bot:
             await self._show_streak(message)
+            return
+        if content.lower() in ("..anicca", ".anicca", "..autodel") and not message.author.bot:
+            await self._show_anicca(message)
             return
         if content.startswith("..") and author_ok:
             cmd, _, arg = content[2:].partition(" ")
@@ -706,6 +731,78 @@ class Helper(discord.Client):
             except discord.HTTPException as e:
                 log.warning("Book rec post failed: %s", e)
             await asyncio.sleep(BOOK_INTERVAL)
+
+    # -- anicca: the channel that forgets ----------------------------------
+    # A rolling ephemeral channel. Messages older than the retention window
+    # are swept on every pass (bulk delete under 14 days, single delete for
+    # older stragglers after downtime). One pinned explainer survives every
+    # sweep so newcomers always have context. Restart-safe and idempotent.
+
+    ANICCA_MARKER = "anicca-notice"
+
+    async def _anicca_ensure_pin(self, channel) -> None:
+        """Guarantee the permanent anicca notice is present and pinned."""
+        try:
+            pins = await channel.pins()
+        except discord.HTTPException:
+            return
+        for m in pins:
+            if (m.author.id == self.user.id and m.embeds
+                    and (m.embeds[0].footer.text or "") == self.ANICCA_MARKER):
+                return  # already there — nothing to do
+        hrs = f"{self.anicca_retention / 3600:g}"
+        color = int(str(self.config.get("PANEL_COLOR", "0xC0A062")), 16)
+        embed = discord.Embed(
+            title="⏳ anicca — a channel that forgets",
+            description=(
+                "***Anicca*** *(Pali: impermanence) — nothing here is meant to last.*\n\n"
+                f"Every message in this channel is **automatically cleared after {hrs} hours**. "
+                "Say what's on your mind, let it go, and don't expect it to still be here "
+                "tomorrow.\n\n"
+                "A space for fleeting thoughts, half-formed ideas, and talk that doesn't need a "
+                "permanent record. Only this pinned note stays."
+            ),
+            color=color,
+        )
+        embed.set_footer(text=self.ANICCA_MARKER)
+        try:
+            msg = await channel.send(embed=embed)
+            await msg.pin(reason="anicca: permanent channel notice")
+            log.info("anicca: posted and pinned the ephemeral-channel notice")
+        except discord.HTTPException as e:
+            log.warning("anicca pin failed: %s", e)
+
+    async def _anicca_loop(self) -> None:
+        import asyncio
+        from datetime import datetime, timezone, timedelta
+
+        await asyncio.sleep(10)  # let the cache settle after on_ready
+        channel = self.get_channel(self.anicca_channel_id)
+        if channel is None:
+            log.warning("anicca: channel %s not found; loop idle", self.anicca_channel_id)
+            return
+        await self._anicca_ensure_pin(channel)
+        hrs = self.anicca_retention / 3600
+
+        while True:
+            channel = self.get_channel(self.anicca_channel_id)
+            if channel is not None:
+                cutoff = datetime.now(timezone.utc) - timedelta(seconds=self.anicca_retention)
+                try:
+                    # bulk=True bulk-deletes <14d and falls back to single
+                    # deletes for anything older (e.g. after a long outage)
+                    deleted = await channel.purge(
+                        limit=None, before=cutoff, bulk=True,
+                        check=lambda m: not m.pinned,
+                        reason=f"anicca: rolling {hrs:g}h window",
+                    )
+                    if deleted:
+                        log.info("anicca: swept %d message(s) older than %gh",
+                                 len(deleted), hrs)
+                except discord.HTTPException as e:
+                    log.warning("anicca sweep failed: %s", e)
+                await self._anicca_ensure_pin(channel)  # re-assert if unpinned
+            await asyncio.sleep(self.anicca_sweep)
 
     # -- contest event forwarding ------------------------------------------
 
