@@ -150,6 +150,9 @@ class Helper(discord.Client):
         self.role_persist_enabled = config.get("ROLE_PERSIST_ENABLED", True)
         self.detain_role_id = int(config.get("DETAIN_ROLE_ID", 0) or 0)
         self._restored: set[int] = set()
+        # on_ready fires again on every gateway reconnect — start the background
+        # loops only once, or reconnects duplicate every loop (double quotes etc.)
+        self._loops_started = False
 
     async def on_ready(self):
         log.info("Politics helper online as %s (%s)", self.user, self.user.id)
@@ -171,25 +174,27 @@ class Helper(discord.Client):
                         except discord.HTTPException:
                             pass
 
-        if self.bump_channel_id:
-            self.loop.create_task(self._bump_bootstrap())
-        if self.general_channel_id and self.config.get("QUOTES_ENABLED", True):
-            self.loop.create_task(self._quote_loop())
-        if int(self.config.get("BOOK_CLUB_CHANNEL_ID", 0) or 0) and self.config.get("BOOK_RECS_ENABLED", True):
-            self.loop.create_task(self._book_loop())
-        if int(self.config.get("PHILOSOPHY_FORUM_CHANNEL_ID", 0) or 0) and self.config.get("FORUM_PROMPTS_ENABLED", True):
-            self.loop.create_task(self._forum_loop())
-        if self.ladder and self.config.get("LADDER_MIN_RANK_DAYS"):
-            self.loop.create_task(self._pending_promotions_loop())
-        if self.ladder:
-            self.loop.create_task(self._rank_reconcile_sweep(guild))
-        await self.rooms.start()
-        await self.contest.start()
-        self.music.start()
-        if self.afk_channel_id:
-            self.loop.create_task(self._afk_loop())
-        if self.anicca_channel_id and self.config.get("ANICCA_ENABLED", True):
-            self.loop.create_task(self._anicca_loop())
+        if not self._loops_started:
+            self._loops_started = True
+            if self.bump_channel_id:
+                self.loop.create_task(self._bump_bootstrap())
+            if self.general_channel_id and self.config.get("QUOTES_ENABLED", True):
+                self.loop.create_task(self._quote_loop())
+            if int(self.config.get("BOOK_CLUB_CHANNEL_ID", 0) or 0) and self.config.get("BOOK_RECS_ENABLED", True):
+                self.loop.create_task(self._book_loop())
+            if int(self.config.get("PHILOSOPHY_FORUM_CHANNEL_ID", 0) or 0) and self.config.get("FORUM_PROMPTS_ENABLED", True):
+                self.loop.create_task(self._forum_loop())
+            if self.ladder and self.config.get("LADDER_MIN_RANK_DAYS"):
+                self.loop.create_task(self._pending_promotions_loop())
+            if self.ladder:
+                self.loop.create_task(self._rank_reconcile_sweep(guild))
+            await self.rooms.start()
+            await self.contest.start()
+            self.music.start()
+            if self.afk_channel_id:
+                self.loop.create_task(self._afk_loop())
+            if self.anicca_channel_id and self.config.get("ANICCA_ENABLED", True):
+                self.loop.create_task(self._anicca_loop())
         # every live room is delete-tracked, whatever it was renamed to
         for cid in self.rooms.rooms:
             self.temp_vcs.setdefault(int(cid), time.monotonic())
