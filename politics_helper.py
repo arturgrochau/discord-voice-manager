@@ -83,9 +83,16 @@ BUMP_XP = 200          # very generous: ~50 messages worth of XP
 REMINDER_TTL = 3 * 60 * 60   # general-chat reminder self-destructs after 3h
 AWARD_TTL = 24 * 60 * 60     # award announcements clean up after a day
 QUOTE_INTERVAL = 4 * 60 * 60
+SPOTLIGHT_INTERVAL = 12 * 60 * 60  # rotating "check out X" nudge, one at a time
 BOOK_INTERVAL = 3 * 24 * 60 * 60   # a book recommendation every 3 days
 FORUM_PROMPT_INTERVAL = 3 * 24 * 60 * 60   # a philosophy-forum prompt every 3 days
 DEFAULT_NADEKO_DB = Path.home() / "Projects/nadekobot/nadeko-osx-arm64/data/NadekoBot.db"
+# plain twitter/x status links embed poorly (or not at all); fxtwitter's proxy
+# embeds render text, images and video properly, so the bot replies with one.
+TWEET_URL_RE = re.compile(
+    r"https?://(?:www\.|m\.|mobile\.)?(?:twitter\.com|x\.com)/(\w{1,15})/status/(\d+)\S*",
+    re.I)
+
 QUOTES_PATH = Path(__file__).resolve().parent / "philosophy_quotes.json"
 BOOK_RECS_PATH = Path(__file__).resolve().parent / "book_recs.json"
 PHIL_PROMPTS_PATH = Path(__file__).resolve().parent / "philosophy_prompts.json"
@@ -186,6 +193,8 @@ class Helper(discord.Client):
                 self.loop.create_task(self._bump_loop())
             if self.general_channel_id and self.config.get("QUOTES_ENABLED", True):
                 self.loop.create_task(self._quote_loop())
+            if self.general_channel_id and self.config.get("SPOTLIGHTS_ENABLED", False):
+                self.loop.create_task(self._spotlight_loop())
             if int(self.config.get("BOOK_CLUB_CHANNEL_ID", 0) or 0) and self.config.get("BOOK_RECS_ENABLED", True):
                 self.loop.create_task(self._book_loop())
             if int(self.config.get("PHILOSOPHY_FORUM_CHANNEL_ID", 0) or 0) and self.config.get("FORUM_PROMPTS_ENABLED", True):
@@ -452,6 +461,8 @@ class Helper(discord.Client):
         await self.contest.on_message(message)
         if not message.author.bot:
             await self._daily_streak(message)
+            if self.config.get("LINK_FIX_ENABLED", True):
+                await self._fix_tweet_links(message)
         # ..music commands work from any chat; room commands only in room chats
         content = (message.content or "").strip()
         # self-authored commands allowed: lets the operator drive the player
@@ -705,6 +716,29 @@ class Helper(discord.Client):
                 pass
         return keep
 
+    async def _fix_tweet_links(self, message) -> None:
+        """Reply to plain twitter/x status links with fxtwitter equivalents so
+        the tweet actually renders (text, images, video). The member's message
+        stays put; only its dud embed is suppressed."""
+        content = message.content or ""
+        lowered = content.lower()
+        if any(s in lowered for s in ("fxtwitter.", "vxtwitter.", "fixupx.")):
+            return
+        fixed = list(dict.fromkeys(
+            f"https://fxtwitter.com/{m.group(1)}/status/{m.group(2)}"
+            for m in TWEET_URL_RE.finditer(content)))[:3]
+        if not fixed:
+            return
+        try:
+            await message.reply("\n".join(fixed), mention_author=False,
+                                allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException:
+            return
+        try:
+            await message.edit(suppress=True)
+        except (discord.HTTPException, discord.Forbidden):
+            pass
+
     @staticmethod
     def _is_quote_post(m) -> bool:
         return bool(m.embeds) and (m.embeds[0].description or "").startswith("*“")
@@ -760,6 +794,99 @@ class Helper(discord.Client):
             except discord.HTTPException as e:
                 log.warning("Quote post failed: %s", e)
             await asyncio.sleep(QUOTE_INTERVAL)
+
+    # -- rotating server spotlights ----------------------------------------
+
+    @staticmethod
+    def _is_spotlight_post(m) -> bool:
+        return bool(m.embeds) and getattr(m.embeds[0].footer, "text", None) == "server spotlight"
+
+    def _spotlight_items(self) -> list[tuple[str, str]]:
+        """Build the rotation from whatever is actually live right now, so a
+        finished giveaway silently drops out instead of being advertised."""
+        from datetime import datetime, timezone
+
+        items: list[tuple[str, str]] = []
+        contest_cfg = self.config.get("CONTEST", {})
+        end_raw = contest_cfg.get("END")
+        if contest_cfg.get("ACTIVE") and end_raw:
+            try:
+                end = datetime.fromisoformat(end_raw)
+                if end > datetime.now(timezone.utc):
+                    ch = int(contest_cfg.get("CHANNEL_ID", 0) or 0)
+                    items.append((
+                        "giveaway",
+                        f"🎁 **5× Discord Nitro** are on the line — see where you stand in <#{ch}>. "
+                        f"Ends <t:{int(end.timestamp())}:R> — chat, hang out in voice and "
+                        f"invite friends to climb the board."))
+            except ValueError:
+                pass
+        book_ch = int(self.config.get("BOOK_CLUB_CHANNEL_ID", 0) or 0)
+        if book_ch:
+            items.append((
+                "book-club",
+                f"📚 Reading something worth arguing about — or hunting for your next book? "
+                f"Share it in <#{book_ch}>."))
+        forum_ch = int(self.config.get("PHILOSOPHY_FORUM_CHANNEL_ID", 0) or 0)
+        if forum_ch:
+            items.append((
+                "philosophy-forum",
+                f"🏛️ Got a take that deserves more than a scrolling chat? "
+                f"Open a topic in <#{forum_ch}> and make your case."))
+        return items
+
+    async def _spotlight_loop(self):
+        """One rotating 'check out X' embed in general-chat. Each new spotlight
+        replaces the previous one, and a round is skipped while the channel is
+        dead so an empty room never accumulates bot nudges."""
+        import asyncio
+
+        from datetime import datetime, timezone
+
+        state_path = Path(__file__).resolve().parent / "spotlight_state.json"
+        try:
+            state = json.loads(state_path.read_text())
+        except Exception:
+            state = {"idx": 0}
+        first_delay = 120
+        channel = self.get_channel(self.general_channel_id)
+        if channel:
+            newest = await self._prune_bot_posts(channel, self._is_spotlight_post, keep_newest=True)
+            if newest is not None:
+                age = (datetime.now(timezone.utc) - newest.created_at).total_seconds()
+                first_delay = max(120, SPOTLIGHT_INTERVAL - age)
+        await asyncio.sleep(first_delay)
+        while True:
+            channel = self.get_channel(self.general_channel_id)
+            items = self._spotlight_items()
+            if channel is None or not items:
+                await asyncio.sleep(SPOTLIGHT_INTERVAL)
+                continue
+            try:
+                # hold the round unless a human has spoken since the standing
+                # spotlight went up — a nudge into a dead room helps nobody
+                human_since, standing = False, None
+                async for m in channel.history(limit=50):
+                    if m.author.id == self.user.id and self._is_spotlight_post(m):
+                        standing = m
+                        break
+                    if not m.author.bot:
+                        human_since = True
+                if standing is not None and not human_since:
+                    await asyncio.sleep(SPOTLIGHT_INTERVAL)
+                    continue
+                idx = state.get("idx", 0) % len(items)
+                key, text = items[idx]
+                state["idx"] = (idx + 1) % len(items)
+                embed = discord.Embed(description=text, color=0xC0A062)
+                embed.set_footer(text="server spotlight")
+                await self._prune_bot_posts(channel, self._is_spotlight_post)
+                await channel.send(embed=embed)
+                state_path.write_text(json.dumps(state))
+                log.info("Posted spotlight: %s", key)
+            except discord.HTTPException as e:
+                log.warning("Spotlight post failed: %s", e)
+            await asyncio.sleep(SPOTLIGHT_INTERVAL)
 
     # -- book club recommendations -----------------------------------------
 
