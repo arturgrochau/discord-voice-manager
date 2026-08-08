@@ -107,9 +107,12 @@ class Helper(discord.Client):
         self.temp_vcs: dict[int, float] = {}  # channel id -> created-at monotonic
         self.bump_channel_id = int(config.get("BUMP_CHANNEL_ID", 0) or 0)
         self.general_channel_id = int(config.get("GENERAL_CHANNEL_ID", 0) or 0)
-        self._bump_task = None
         self._last_reward_at = 0.0
         self._reminder_msgs: list = []  # live reminder messages to clear on bump
+        # bump state persisted to disk so reminders survive restarts: a poll
+        # loop (not a fragile in-memory timer) owns the reminder lifecycle
+        self._bump_state = self._bump_state_load()
+        self._bump_cleared_for = None   # in-memory: window we last cleared
         self.nadeko_db = Path(config.get("NADEKO_DB_PATH", DEFAULT_NADEKO_DB)).expanduser()
         # everyone holds at least this role until their first ladder rank
         self.autorole_id = int(config.get("AUTOROLE_ID", 0) or 0)
@@ -174,10 +177,13 @@ class Helper(discord.Client):
                         except discord.HTTPException:
                             pass
 
+        # rescue anyone left stranded in Join-to-Create across a restart/blip
+        await self._drain_trigger_channel(guild)
+
         if not self._loops_started:
             self._loops_started = True
             if self.bump_channel_id:
-                self.loop.create_task(self._bump_bootstrap())
+                self.loop.create_task(self._bump_loop())
             if self.general_channel_id and self.config.get("QUOTES_ENABLED", True):
                 self.loop.create_task(self._quote_loop())
             if int(self.config.get("BOOK_CLUB_CHANNEL_ID", 0) or 0) and self.config.get("BOOK_RECS_ENABLED", True):
@@ -219,36 +225,73 @@ class Helper(discord.Client):
         blob = " ".join(e.description or "" for e in message.embeds) + (message.content or "")
         return "bump done" in blob.lower()
 
-    async def _bump_bootstrap(self):
-        import asyncio
-        from datetime import datetime, timezone
+    def _bump_state_load(self) -> dict:
+        try:
+            return json.loads((BASE_DIR / "bump_state.json").read_text())
+        except Exception:
+            return {}
 
+    def _bump_state_save(self) -> None:
+        try:
+            (BASE_DIR / "bump_state.json").write_text(json.dumps(self._bump_state))
+        except Exception:
+            log.exception("bump state save failed")
+
+    async def _bump_loop(self):
+        """Restart-proof bump reminder. A persisted last-bump timestamp drives
+        a once-a-minute check: post exactly one reminder when the 2h window
+        opens, and retire any lingering reminder the moment a bump lands. No
+        in-memory timer to lose on a reconnect, so it never silently forgets
+        and never nags when it isn't actually time."""
+        import asyncio
+
+        await self._bump_seed_from_history()
+        while True:
+            try:
+                await self._bump_tick()
+            except Exception:
+                log.exception("bump loop tick failed")
+            await asyncio.sleep(60)
+
+    async def _bump_seed_from_history(self):
+        """First run only: recover the last bump time from channel history so a
+        fresh state file doesn't wrongly announce an open window."""
+        if self._bump_state.get("last_bump_ts"):
+            return
         channel = self.get_channel(self.bump_channel_id)
         if channel is None:
             return
-        last_bump = None
-        reminder_after_bump = False
-        async for m in channel.history(limit=50):
-            if self._is_bump_done(m):
-                last_bump = m.created_at
-                break
-            if m.author.id == self.user.id and "Bump available" in (m.content or ""):
-                reminder_after_bump = True
-        if last_bump is None:
-            await self._post_bump_reminder()
-            return
-        elapsed = (datetime.now(timezone.utc) - last_bump).total_seconds()
-        if elapsed < BUMP_COOLDOWN:
-            await asyncio.sleep(BUMP_COOLDOWN - elapsed)
-            await self._post_bump_reminder()
-        elif not reminder_after_bump:
-            await self._post_bump_reminder()
+        try:
+            async for m in channel.history(limit=100):
+                if self._is_bump_done(m):
+                    self._bump_state["last_bump_ts"] = m.created_at.timestamp()
+                    self._bump_state_save()
+                    return
+        except discord.HTTPException:
+            pass
+
+    async def _bump_tick(self):
+        now = time.time()
+        last = self._bump_state.get("last_bump_ts") or 0
+        due = (last + BUMP_COOLDOWN) if last else now
+        if now >= due:
+            # window open — ensure exactly one reminder stands for this window
+            if self._bump_state.get("reminded_for") != last:
+                await self._clear_reminders()
+                await self._post_bump_reminder()
+                self._bump_state["reminded_for"] = last
+                self._bump_state_save()
+        else:
+            # within cooldown of a fresh bump — no reminder should be visible
+            if self._bump_cleared_for != last:
+                self._bump_cleared_for = last
+                await self._clear_reminders()
 
     async def _post_bump_reminder(self):
         """Announce the open bump window in the bump channel and general chat.
 
-        Reminders self-destruct after REMINDER_TTL and are also removed the
-        moment someone bumps, so no stale pings linger.
+        The reminder stays up until someone bumps (the poll loop and the
+        bump-done handler both remove it), so it never vanishes unbumped.
         """
         self._reminder_msgs = [m for m in self._reminder_msgs if m]
         for channel_id, text in (
@@ -262,7 +305,7 @@ class Helper(discord.Client):
             if not channel:
                 continue
             try:
-                msg = await channel.send(text, delete_after=REMINDER_TTL)
+                msg = await channel.send(text)
                 self._reminder_msgs.append(msg)
             except discord.HTTPException as e:
                 log.warning("Bump reminder failed in %s: %s", channel_id, e)
@@ -448,6 +491,11 @@ class Helper(discord.Client):
         if message.channel.id != self.bump_channel_id or not self._is_bump_done(message):
             return
         await self._clear_reminders()
+        # record the bump so the poll loop reschedules the next reminder, even
+        # across a restart; window == this bump's timestamp
+        self._bump_state["last_bump_ts"] = message.created_at.timestamp()
+        self._bump_cleared_for = self._bump_state["last_bump_ts"]
+        self._bump_state_save()
 
         # reward the bumper — only one reward per legitimate bump window
         meta = getattr(message, "interaction_metadata", None) or getattr(message, "interaction", None)
@@ -466,14 +514,6 @@ class Helper(discord.Client):
                 log.exception("Bump XP award failed for %s", bumper)
 
         log.info("Bump detected; next reminder in %d min", BUMP_COOLDOWN // 60)
-        if self._bump_task and not self._bump_task.done():
-            self._bump_task.cancel()
-
-        async def remind_later():
-            await asyncio.sleep(BUMP_COOLDOWN)
-            await self._post_bump_reminder()
-
-        self._bump_task = self.loop.create_task(remind_later())
 
     # -- modmail -----------------------------------------------------------
 
@@ -1228,35 +1268,50 @@ class Helper(discord.Client):
 
     # -- join to create ----------------------------------------------------
 
+    async def _spawn_room(self, member):
+        """Create a temp VC for `member` and move them in. Debounced so the
+        duplicate voice events that arrive mid-move don't spawn twins."""
+        if member.id in self._spawning:
+            return
+        self._spawning.add(member.id)
+        guild = member.guild
+        category = guild.get_channel(self.category_id)
+        name = f"{TEMP_VC_PREFIX}{member.display_name}'s room"[:100]
+        overwrites = {member: vc_rooms._owner_overwrite()}
+        try:
+            vc = await guild.create_voice_channel(
+                name, category=category, overwrites=overwrites,
+                bitrate=int(guild.bitrate_limit),  # best audio the tier allows
+                reason=f"Join-to-Create: room for {member}",
+            )
+            self.temp_vcs[vc.id] = time.monotonic()
+            await member.move_to(vc, reason="Join-to-Create")
+            await self.rooms.setup_room(vc, member)
+            log.info("Created temp VC %r for %s", vc.name, member)
+        except discord.HTTPException as e:
+            log.warning("Join-to-Create failed for %s: %s", member, e)
+        finally:
+            self.loop.create_task(self._release_spawn(member.id))
+
+    async def _drain_trigger_channel(self, guild):
+        """Self-heal: anyone sitting in the trigger channel (they joined while
+        we were offline/reconnecting, so we never saw the join event) gets a
+        room now. Runs on every on_ready, so a restart or gateway blip never
+        leaves members stranded in Join-to-Create."""
+        trigger = guild.get_channel(self.trigger_id)
+        if not trigger:
+            return
+        for m in list(getattr(trigger, "members", [])):
+            if not m.bot:
+                await self._spawn_room(m)
+
     async def on_voice_state_update(self, member, before, after):
         if member.bot:
             return
         self._afk_track(member, after)
         # spawn a room (debounced: duplicate voice events arrive while moving)
         if after.channel and after.channel.id == self.trigger_id:
-            if member.id in self._spawning:
-                return
-            self._spawning.add(member.id)
-            guild = member.guild
-            category = guild.get_channel(self.category_id)
-            name = f"{TEMP_VC_PREFIX}{member.display_name}'s room"[:100]
-            overwrites = {
-                member: vc_rooms._owner_overwrite()
-            }
-            try:
-                vc = await guild.create_voice_channel(
-                    name, category=category, overwrites=overwrites,
-                    bitrate=int(guild.bitrate_limit),  # best audio the tier allows
-                    reason=f"Join-to-Create: room for {member}",
-                )
-                self.temp_vcs[vc.id] = time.monotonic()
-                await member.move_to(vc, reason="Join-to-Create")
-                await self.rooms.setup_room(vc, member)
-                log.info("Created temp VC %r for %s", vc.name, member)
-            except discord.HTTPException as e:
-                log.warning("Join-to-Create failed for %s: %s", member, e)
-            finally:
-                self.loop.create_task(self._release_spawn(member.id))
+            await self._spawn_room(member)
             return
         # clean up an emptied room (grace period covers the create->move gap)
         if before.channel and before.channel.id in self.temp_vcs and not before.channel.members:

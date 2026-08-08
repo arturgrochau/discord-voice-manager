@@ -144,6 +144,9 @@ class MusicPlayer:
         self.state_path = (base_dir or Path(".")) / "music_state.json"
         self.cache_dir = (base_dir or Path(".")) / "music_cache"
         self._last_channel_id = 0  # watchdog reconnect target
+        # never occupy the Join-to-Create trigger channel: camping it there
+        # blocks the room-spawn flow and leaves members stuck
+        self.trigger_id = int(config.get("JOIN_TO_CREATE_CHANNEL_ID", 0) or 0)
         self.enabled = bool(config.get("MUSIC_ENABLED"))
         self.idle_seconds = int(config.get("MUSIC_IDLE_SECONDS", IDLE_SECONDS_DEFAULT))
         self.color = int(str(config.get("PANEL_COLOR", "0x5865F2")), 16)
@@ -192,7 +195,11 @@ class MusicPlayer:
         if not (data.get("voice") and data.get("queue")):
             return
         ch = self.client.get_channel(int(data["voice"]))
-        humans = [m for m in ch.members if not m.bot] if ch else []
+        # never resume inside the Join-to-Create trigger channel
+        if ch is None or (self.trigger_id and ch.id == self.trigger_id):
+            self._clear_state()
+            return
+        humans = [m for m in ch.members if not m.bot]
         if not humans:
             self._clear_state()
             return
@@ -306,6 +313,9 @@ class MusicPlayer:
                 return "Join a voice channel first, then I'll follow you in."
         else:
             target = member.voice.channel
+        if self.trigger_id and target.id == self.trigger_id:
+            return ("That's the Join-to-Create channel — it makes you a room. "
+                    "Hop into your room (or any other voice channel) and I'll follow.")
         if self.voice and self.voice.is_connected():
             if self.voice.channel.id == target.id:
                 return None
