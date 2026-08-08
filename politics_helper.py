@@ -816,23 +816,22 @@ class Helper(discord.Client):
                     ch = int(contest_cfg.get("CHANNEL_ID", 0) or 0)
                     items.append((
                         "giveaway",
-                        f"🎁 **5× Discord Nitro** are on the line — see where you stand in <#{ch}>. "
-                        f"Ends <t:{int(end.timestamp())}:R> — chat, hang out in voice and "
-                        f"invite friends to climb the board."))
+                        f"🎁 **5x Discord Nitro** giveaway ends <t:{int(end.timestamp())}:R>. "
+                        f"See where you stand in <#{ch}>."))
             except ValueError:
                 pass
         book_ch = int(self.config.get("BOOK_CLUB_CHANNEL_ID", 0) or 0)
         if book_ch:
             items.append((
                 "book-club",
-                f"📚 Reading something worth arguing about — or hunting for your next book? "
-                f"Share it in <#{book_ch}>."))
+                f"📚 Have a book recommendation, or want your next read? "
+                f"Check out <#{book_ch}>."))
         forum_ch = int(self.config.get("PHILOSOPHY_FORUM_CHANNEL_ID", 0) or 0)
         if forum_ch:
             items.append((
                 "philosophy-forum",
-                f"🏛️ Got a take that deserves more than a scrolling chat? "
-                f"Open a topic in <#{forum_ch}> and make your case."))
+                f"🏛️ Have a topic or opinion you want to dig into? "
+                f"Open a thread in <#{forum_ch}>."))
         return items
 
     async def _spotlight_loop(self):
