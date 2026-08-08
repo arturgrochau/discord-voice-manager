@@ -174,6 +174,11 @@ def build_embeds(s: dict) -> list[dict]:
            "**💤 AFK parking** — muted 3 h straight (not streaming), or alone in a "
            "call for 3 h, moves you to 💤〡AFK, where nobody can speak. Leave or "
            "rejoin any channel to reset.\n"
+           "**🔗 Tweet embeds** — plain twitter/x links get an auto-reply with a "
+           "working fxtwitter embed (the member's message stays put).\n"
+           "**✨ Server spotlight** — one rotating self-replacing nudge in general "
+           "chat (~12 h): giveaway · book club · philosophy forum. Skips rounds "
+           "while the channel is quiet.\n"
            if s["extras"] else "")
         + "**🧹 Command hygiene** — Nadeko also deletes command invocations "
         "(`;delmsgoncmd` is on)."
