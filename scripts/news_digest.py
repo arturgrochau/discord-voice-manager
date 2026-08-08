@@ -12,13 +12,15 @@ article link when no good X post exists).
 
 Two modes:
   full digest (default) — the original 3+4+3 daily roundup
-  --pulse             — rolling 15-minute breaking-news check: up to 2 fresh
-                        stories per section, expected to post NOTHING most
-                        runs; rate-limited so the channels never flood.
+  --pulse             — one news EDITION: the 3-5 juiciest, non-redundant
+                        stories since the previous edition, migration-in-
+                        Europe beat prioritised; fewer (or none) when the
+                        window is thin.
 
 Run manually:  .venv/bin/python scripts/news_digest.py [--pulse]
 Scheduled by:  com.arturgrochau.pnp-news system daemon on the M1
-               (StartInterval 900 → --pulse every 15 minutes)
+               (StartCalendarInterval 09:00 / 16:00 / 22:30 local —
+                3 editions/day to keep Grok token spend low)
 """
 
 import argparse
@@ -124,21 +126,31 @@ sovereignty and migration stories when they posted about today's news.
 
 {skip_note}"""
 
-PULSE_RESEARCH_PROMPT = """It is {date}, {time} UTC. You are the standing news
-desk for a European politics discussion server. The audience cares about
+PULSE_RESEARCH_PROMPT = """It is {date}, {time} UTC. You are the news desk of
+a European politics discussion server that publishes one edition roughly
+every 7 hours (morning / afternoon / late evening). The audience cares about
 European sovereignty, EU and national politics, elections, migration and
 borders, security and defence, energy independence, and Europe's economic
 and technological standing (global stories count when they affect Europe).
 
-Your job every run: surface the **freshest, most significant** stories this
-audience has NOT seen yet. Run MANY live web and X searches right now — the
-front pages of Reuters/AFP/BBC/FT/Bloomberg/Politico Europe/Euronews, plus
-`site:x.com <keywords>` queries — do not answer from memory. Prioritise
-stories with a real development in roughly the last 6-12 hours, but a major
-ongoing story with a meaningful new angle is fine too.
+Your job this edition: surface ONLY the juiciest, most consequential stories
+since the previous edition — roughly the last 7-9 hours (a slightly older
+story is fine when it is major and absent from the covered list). Run MANY
+live web and X searches right now — the front pages of
+Reuters/AFP/BBC/FT/Bloomberg/Politico Europe/Euronews, plus
+`site:x.com <keywords>` queries — do not answer from memory.
 
-Return the TOP 2 to 3 stories overall, ranked by IMPORTANCE first. Rank each
-candidate by:
+PRIORITY BEAT — migration and borders in Europe. ALWAYS run dedicated
+searches on this beat every edition: asylum and deportation policy, border
+enforcement and Schengen disputes, Channel/Mediterranean crossings, court
+rulings on migration, migration-driven unrest and protests, migrant-crime
+cases confirmed by major outlets, and the fortunes of migration-critical
+parties and figures (Reform UK, AfD, RN, PVV, FdI, Vox, Fidesz, FPÖ, SD).
+When a solid, well-sourced story on this beat exists in the window, it MUST
+be one of your picks and it outranks similarly-fresh stories on other beats.
+
+Return the TOP 3 to 5 stories overall — quality over volume; return fewer
+when the window is thin, and never pad with filler. Rank each candidate by:
   1. Significance — how many people it affects, how consequential it is.
   2. Credible traction — how widely MAJOR outlets and high-follower credible
      accounts are covering it, and how much genuine engagement the best posts
@@ -149,9 +161,10 @@ story just because a post went viral. Skip rage-bait, engagement-bait,
 single-source rumours, and anything you cannot confirm from a major outlet.
 Prefer the story that is both important AND well-sourced.
 
-There is ALWAYS relevant news in the world — on a normal run you WILL find 2-3
-worth posting. Only return "no new stories" in the rare case where every
-genuinely significant current story is already in the covered list below.
+There is ALWAYS relevant news in the world — over a 7-9 hour window you WILL
+normally find 3-5 worth posting. Only return "no new stories" in the rare
+case where every genuinely significant current story is already in the
+covered list below.
 
 HARD non-redundancy rule: do NOT return anything substantially similar to a
 story in the already-covered list — not the same event from another outlet,
@@ -159,9 +172,14 @@ not a follow-up with no new information, not a reworded headline. If your best
 pick is already covered, skip it and go to the next most significant fresh
 story. Also skip pure opinion/explainers/anniversaries; report events.
 
+Collapse incremental updates: when several candidates are developments of the
+SAME ongoing storyline (e.g. three overnight strike reports from the same
+war), keep only the single biggest development and drop the rest — one story
+per storyline per edition.
+
 {section_rules}
 
-Write a short markdown list of your 2-3 picks, each labelled WORLD EVENTS /
+Write a short markdown list of your 3-5 picks, each labelled WORLD EVENTS /
 EUROPE NEWS / ECON & TECH. For each: a short factual headline, then the URLs
 you actually saw in your search results. ALWAYS include the primary-source
 ARTICLE URL from a reputable outlet — that is the link that gets posted.
@@ -204,7 +222,7 @@ them.
 {research}"""
 
 PULSE_STRUCTURE_PROMPT = """Convert the following researched news list into
-JSON. Sections: world_events, europe_news, econ_tech — each 0 to 2 stories,
+JSON. Sections: world_events, europe_news, econ_tech — each 0 to 3 stories,
 ONLY stories actually present in the text. If the text reports no new
 stories for a section, return an empty array for it — never invent stories.
 
@@ -225,11 +243,11 @@ log = logging.getLogger("news-digest")
 HISTORY_PATH = BASE_DIR / "digest_history.json"
 PULSE_STATE_PATH = BASE_DIR / "pulse_state.json"
 
-# flow guards: with a 30-minute cadence and 2-3 fresh stories per run this
-# gives a steady ~4-6 posts/hour without flooding; dedup keeps them distinct
+# flow guards: 3 editions/day (09:00/16:00/22:30 local), 3-5 stories each —
+# ~9-15 posts/day total; dedup + storyline-collapse keep them distinct
 PULSE_HOURLY_CAP = 6
-PULSE_SECTION_CAP = 2
-PULSE_RUN_CAP = 3
+PULSE_SECTION_CAP = 3
+PULSE_RUN_CAP = 5
 
 
 def pulse_recent_posts() -> list[float]:
@@ -623,7 +641,7 @@ def main() -> None:
         try:
             data = gather_pulse()
         except Exception:
-            log.exception("Pulse gather failed; next run in 15 min")
+            log.exception("Pulse gather failed; next edition will retry")
             return
         total = sum(post_section(section, data[section], token)
                     for section in CHANNELS if data.get(section))
