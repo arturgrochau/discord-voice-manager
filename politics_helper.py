@@ -90,7 +90,7 @@ DEFAULT_NADEKO_DB = Path.home() / "Projects/nadekobot/nadeko-osx-arm64/data/Nade
 # plain twitter/x status links embed poorly (or not at all); fxtwitter's proxy
 # embeds render text, images and video properly, so the bot replies with one.
 TWEET_URL_RE = re.compile(
-    r"https?://(?:www\.|m\.|mobile\.)?(?:twitter\.com|x\.com)/(\w{1,15})/status/(\d+)\S*",
+    r"https?://(?:www\.|m\.|mobile\.)?(?:twitter\.com|x\.com)/(?:i/web|(\w{1,15}))/status/(\d+)\S*",
     re.I)
 
 QUOTES_PATH = Path(__file__).resolve().parent / "philosophy_quotes.json"
@@ -725,7 +725,7 @@ class Helper(discord.Client):
         if any(s in lowered for s in ("fxtwitter.", "vxtwitter.", "fixupx.")):
             return
         fixed = list(dict.fromkeys(
-            f"https://fxtwitter.com/{m.group(1)}/status/{m.group(2)}"
+            f"https://fxtwitter.com/{m.group(1) or 'i'}/status/{m.group(2)}"
             for m in TWEET_URL_RE.finditer(content)))[:3]
         if not fixed:
             return
