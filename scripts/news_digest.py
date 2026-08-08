@@ -397,6 +397,12 @@ def run_grok(prompt: str, schema: str | None = None) -> str:
     if schema:
         cmd += ["--json-schema", schema]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600, cwd=str(Path.home()))
+    # A dead CLI (expired auth, spent credits, API outage) prints an error and
+    # exits; an empty stdout must be a loud failure, never "no news today".
+    if proc.returncode != 0 or not proc.stdout.strip():
+        detail = (proc.stderr.strip() or proc.stdout.strip())[-500:]
+        raise RuntimeError(
+            f"grok CLI failed (rc={proc.returncode}, stdout={len(proc.stdout)}B): {detail}")
     return proc.stdout
 
 
