@@ -888,7 +888,7 @@ class RoomPanel(discord.ui.View):
                     "Nobody is banned from this room. 🎉", ephemeral=True)
             await interaction.response.send_message("Unban who?", view=view, ephemeral=True)
 
-    @discord.ui.button(label="Bans", emoji="📋", style=discord.ButtonStyle.danger,
+    @discord.ui.button(label="Bans", emoji="📋", style=discord.ButtonStyle.primary,
                        custom_id="vcr:bans", row=3)
     async def b_bans(self, interaction, _):
         if (vc := await self._guard(interaction)):
