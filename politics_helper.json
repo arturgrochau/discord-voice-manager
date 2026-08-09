@@ -93,5 +93,17 @@
   "FORUM_PROMPTS_ENABLED": true,
   "PHILOSOPHY_FORUM_CHANNEL_ID": "1297655205361487903",
   "SPOTLIGHTS_ENABLED": true,
-  "LINK_FIX_ENABLED": true
+  "LINK_FIX_ENABLED": true,
+  "LADDER_MIN_RANK_MINUTES": [
+    0,
+    30,
+    120,
+    360,
+    720,
+    1440,
+    2880,
+    5760,
+    10080,
+    20160
+  ]
 }

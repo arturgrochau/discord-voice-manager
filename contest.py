@@ -187,7 +187,10 @@ class Contest:
                         continue  # no points for idling alone
                     for m in humans:
                         v = m.voice
-                        if v and not (v.self_mute or v.mute or v.self_deaf or v.deaf):
+                        # credit anyone present and listening — only the
+                        # deafened (truly away) are skipped. Muted-but-here
+                        # still counts, so people don't show 0 min in voice.
+                        if v and not (v.self_deaf or v.deaf):
                             uid = str(m.id)
                             self.state["vc_seconds"][uid] = self.state["vc_seconds"].get(uid, 0) + 60
                             changed = True
@@ -203,9 +206,13 @@ class Contest:
         current = self._xp_snapshot()
         baseline = self.state.get("baseline", {})
         uids = set(current) | set(self.state.get("invites", {})) | set(self.state.get("vc_seconds", {}))
+        guild = self.client.get_guild(self.guild_id)
         out = []
         for uid in uids:
             if uid in self.exclude:
+                continue
+            # drop anyone who left the server — they can't win, so hide them
+            if guild is not None and guild.get_member(int(uid)) is None:
                 continue
             # deliberately unclamped: mods can push a score down with a
             # negative .xpadd and the correction lands on the next render
@@ -256,7 +263,7 @@ class Contest:
                 + "\n\n**How to score**\n"
                 "• All XP you earn counts. Chat and voice both work, voice pays ~3x faster\n"
                 f"• Each friend you invite who stays: **+{self.invite_pts} pts**\n"
-                f"• Every minute unmuted in voice with others: **+{self.vc_pts:g} pts**\n\n"
+                f"• Every minute in voice with others (muted is fine, just don't deafen): **+{self.vc_pts:g} pts**\n\n"
                 "**Prizes** (everyone in the top 10 wins XP)\n"
                 "🥇 1 month of Nitro + the **Mythical** role + **50,000 XP**\n"
                 "🥈 1 month of Nitro + **30,000 XP**\n"

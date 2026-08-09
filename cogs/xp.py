@@ -36,6 +36,18 @@ def bar(frac: float, width: int = 12) -> str:
     return "▰" * filled + "▱" * (width - filled)
 
 
+def fmt_dur(seconds: float) -> str:
+    """Human-friendly tenure duration: '30 min', '2 h', '1.5 days'."""
+    s = max(0.0, float(seconds))
+    if s < 3600:
+        return f"{round(s / 60)} min"
+    if s < 86400:
+        h = s / 3600
+        return f"{h:.0f} h" if abs(h - round(h)) < 0.05 else f"{h:.1f} h"
+    d = s / 86400
+    return f"{d:.0f} day{'s' if round(d) != 1 else ''}" if abs(d - round(d)) < 0.05 else f"{d:.1f} days"
+
+
 class Xp(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -54,8 +66,13 @@ class Xp(commands.Cog):
             return [], [], []
         roles = [int(r) for r in cfg.get("LADDER", [])]
         levels = [int(x) for x in cfg.get("LADDER_LEVELS", [])]
-        min_days = [float(x) for x in cfg.get("LADDER_MIN_RANK_DAYS", [])]
-        return roles, levels, min_days
+        # tenure in seconds: prefer fine-grained minutes, else legacy days
+        mins = cfg.get("LADDER_MIN_RANK_MINUTES")
+        if mins:
+            min_secs = [float(x) * 60 for x in mins]
+        else:
+            min_secs = [float(x) * 86400 for x in cfg.get("LADDER_MIN_RANK_DAYS", [])]
+        return roles, levels, min_secs
 
     def _state(self) -> dict:
         home = self._helper_home()
@@ -84,7 +101,7 @@ class Xp(commands.Cog):
         if ctx.guild is None:
             return
         member = member or ctx.author
-        roles, levels, min_days = self._ladder()
+        roles, levels, min_secs = self._ladder()
         try:
             xp = self._xp_of(ctx.guild.id, member.id)
         except Exception:
@@ -109,28 +126,28 @@ class Xp(commands.Cog):
                 left = max(0.0, pending.get("eligible_at", 0) - time.time())
                 lines.append(
                     f"**Next:** {p_role.mention} — ✅ XP earned! Unlocks in "
-                    f"**{left / 86400:.1f} day(s)** (tenure gate)."
+                    f"**{fmt_dur(left)}** (tenure gate)."
                 )
             elif xp >= need_xp:
                 lines.append(f"**Next:** {next_role.mention} — XP reached; promotion lands on your next activity.")
             else:
                 to_go = need_xp - xp
                 frac = 0.0 if need_xp == 0 else xp / need_xp
-                est_voice = to_go / (12 * 60)   # 12 XP/min in voice
-                est_msgs = math.ceil(to_go / 4)  # 4 XP/message
+                est_voice = to_go / (3 * 60)    # 3 XP/min in voice
+                est_msgs = math.ceil(to_go / 2)  # 2 XP/message
                 lines.append(
                     f"**Next:** {next_role.mention} at level {need_level} "
                     f"({need_xp:,} XP)\n{bar(frac)} `{xp:,}/{need_xp:,}`\n"
                     f"**{to_go:,} XP to go** ≈ {est_voice:.1f}h in voice 🎙️ "
-                    f"or ~{est_msgs:,} messages 💬 (voice levels ~3× faster)"
+                    f"or ~{est_msgs:,} messages 💬 (voice levels ~2× faster)"
                 )
-                if next_i < len(min_days) and min_days[next_i] > 0:
+                if next_i < len(min_secs) and min_secs[next_i] > 0:
                     since = state.get("since", {}).get(str(member.id), {}).get(str(roles[rank_i])) if rank_i is not None else None
                     if since:
-                        served = (time.time() - since) / 86400
-                        lines.append(f"**Tenure:** {served:.1f}/{min_days[next_i]:.0f} days at current rank")
+                        served = time.time() - since
+                        lines.append(f"**Tenure:** {fmt_dur(served)} / {fmt_dur(min_secs[next_i])} at current rank")
                     else:
-                        lines.append(f"**Tenure:** {min_days[next_i]:.0f} day(s) at current rank also required")
+                        lines.append(f"**Tenure:** {fmt_dur(min_secs[next_i])} at current rank also required")
         elif roles and rank_i == len(roles) - 1:
             lines.append("🏆 **Top of the ladder — nothing left to climb.**")
 

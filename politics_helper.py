@@ -93,6 +93,29 @@ TWEET_URL_RE = re.compile(
     r"https?://(?:www\.|m\.|mobile\.)?(?:twitter\.com|x\.com)/(?:i/web|(\w{1,15}))/status/(\d+)\S*",
     re.I)
 
+def total_xp_for_level(level: int) -> int:
+    """Nadeko cumulative XP to reach a level: 4.5·L² + 31.5·L."""
+    return int(4.5 * level * level + 31.5 * level)
+
+
+def level_from_xp(xp: int) -> int:
+    """Inverse of total_xp_for_level (9L² + 63L − 2·xp = 0)."""
+    import math
+    return int((-63 + math.sqrt(3969 + 72 * max(0, int(xp)))) / 18)
+
+
+def fmt_duration(seconds: float) -> str:
+    """Human-friendly tenure duration: '30 min', '2 h', '1.5 days'."""
+    s = max(0.0, float(seconds))
+    if s < 3600:
+        return f"{round(s / 60)} min"
+    if s < 86400:
+        h = s / 3600
+        return f"{h:.0f} h" if abs(h - round(h)) < 0.05 else f"{h:.1f} h"
+    d = s / 86400
+    return f"{d:.0f} day{'s' if round(d) != 1 else ''}" if abs(d - round(d)) < 0.05 else f"{d:.1f} days"
+
+
 QUOTES_PATH = Path(__file__).resolve().parent / "philosophy_quotes.json"
 BOOK_RECS_PATH = Path(__file__).resolve().parent / "book_recs.json"
 PHIL_PROMPTS_PATH = Path(__file__).resolve().parent / "philosophy_prompts.json"
@@ -199,7 +222,8 @@ class Helper(discord.Client):
                 self.loop.create_task(self._book_loop())
             if int(self.config.get("PHILOSOPHY_FORUM_CHANNEL_ID", 0) or 0) and self.config.get("FORUM_PROMPTS_ENABLED", True):
                 self.loop.create_task(self._forum_loop())
-            if self.ladder and self.config.get("LADDER_MIN_RANK_DAYS"):
+            if self.ladder and (self.config.get("LADDER_MIN_RANK_MINUTES")
+                                or self.config.get("LADDER_MIN_RANK_DAYS")):
                 self.loop.create_task(self._pending_promotions_loop())
             if self.ladder:
                 self.loop.create_task(self._rank_reconcile_sweep(guild))
@@ -430,6 +454,92 @@ class Helper(discord.Client):
         except discord.HTTPException:
             pass
 
+    def _read_xp(self, user_id: int) -> int:
+        """Read a member's Nadeko server XP (read-only, never writes)."""
+        import sqlite3
+
+        try:
+            with sqlite3.connect(f"file:{self.nadeko_db}?mode=ro", uri=True, timeout=5) as db:
+                row = db.execute(
+                    "SELECT Xp FROM UserXpStats WHERE UserId=? AND GuildId=?",
+                    (user_id, self.guild_id),
+                ).fetchone()
+            return int(row[0]) if row else 0
+        except Exception:
+            return 0
+
+    async def _show_level(self, message) -> None:
+        """`..level` — a self-service rank card: level, XP bar to the next
+        rank, live tenure countdown, and the member's own avatar."""
+        import time as _t
+
+        member = message.author
+        guild = message.guild
+        xp = self._read_xp(member.id)
+        level = level_from_xp(xp)
+        roles = self.ladder
+        levels = [int(x) for x in self.config.get("LADDER_LEVELS", [])]
+        state = self._ladder_state_load()
+
+        lines = [f"**Level {level}** · **{xp:,} XP** total"]
+        held = [i for i, r in enumerate(roles) if guild.get_role(r) in member.roles]
+        rank_i = max(held) if held else None
+        if rank_i is not None:
+            rr = guild.get_role(roles[rank_i])
+            if rr:
+                lines.append(f"**Rank:** {rr.mention}")
+
+        next_i = (rank_i + 1) if rank_i is not None else 0
+        if roles and next_i < len(roles) and next_i < len(levels):
+            next_role = guild.get_role(roles[next_i])
+            nm = next_role.mention if next_role else "your next rank"
+            need_level = levels[next_i]
+            need_xp = total_xp_for_level(need_level)
+            pending = state.get("pending", {}).get(str(member.id))
+            if pending and int(pending.get("role", 0)) in roles:
+                pr = guild.get_role(int(pending["role"]))
+                left = max(0.0, pending.get("eligible_at", 0) - _t.time())
+                lines.append(f"**Next:** {pr.mention if pr else nm} — ✅ XP earned! "
+                             f"Unlocks in **{fmt_duration(left)}** (tenure gate).")
+            elif xp >= need_xp:
+                lines.append(f"**Next:** {nm} — XP reached; promotion lands on your next activity.")
+            else:
+                to_go = need_xp - xp
+                frac = 0.0 if need_xp == 0 else xp / need_xp
+                filled = round(max(0.0, min(1.0, frac)) * 12)
+                bar = "▰" * filled + "▱" * (12 - filled)
+                est_voice = to_go / (3 * 60)     # 3 XP/min in voice
+                import math as _m
+                est_msgs = _m.ceil(to_go / 2)    # 2 XP/message
+                lines.append(
+                    f"**Next:** {nm} at level {need_level} ({need_xp:,} XP)\n"
+                    f"{bar} `{xp:,}/{need_xp:,}`\n"
+                    f"**{to_go:,} XP to go** ≈ {est_voice:.1f}h in voice 🎙️ "
+                    f"or ~{est_msgs:,} messages 💬 (voice ~2× faster)")
+                req = self._min_seconds(next_i)
+                if req > 0:
+                    since = (state.get("since", {}).get(str(member.id), {})
+                             .get(str(roles[rank_i])) if rank_i is not None else None)
+                    if since:
+                        served = _t.time() - since
+                        lines.append(f"**Tenure:** {fmt_duration(served)} / "
+                                     f"{fmt_duration(req)} at current rank")
+                    else:
+                        lines.append(f"**Tenure:** {fmt_duration(req)} at current rank also required")
+        elif roles and rank_i == len(roles) - 1:
+            lines.append("🏆 **Top of the ladder — nothing left to climb.**")
+
+        color = int(str(self.config.get("PANEL_COLOR", "0xC0A062")), 16)
+        embed = discord.Embed(description="\n".join(lines), color=color)
+        embed.set_author(name=f"{member.display_name} — rank progress",
+                         icon_url=member.display_avatar.url)
+        embed.set_thumbnail(url=member.display_avatar.url)
+        try:
+            await message.channel.send(embed=embed, delete_after=90)
+            await message.delete(delay=2)
+        except discord.HTTPException:
+            pass
+
     async def _show_anicca(self, message) -> None:
         """Explain the ephemeral channel on demand (this reply is swept too)."""
         hrs = f"{self.anicca_retention / 3600:g}"
@@ -474,6 +584,11 @@ class Helper(discord.Client):
             return
         if content.lower() in ("..anicca", ".anicca", "..autodel") and not message.author.bot:
             await self._show_anicca(message)
+            return
+        # ..level / ..rank card (two-dot = member self-service). Single-dot
+        # `.level` stays owned by the sentinel, so we only claim the `..` forms.
+        if content.lower() in ("..level", "..lvl", "..rank", "..next") and not message.author.bot:
+            await self._show_level(message)
             return
         if content.startswith("..") and author_ok:
             cmd, _, arg = content[2:].partition(" ")
@@ -1202,10 +1317,19 @@ class Helper(discord.Client):
     def _ladder_state_save(self, state: dict) -> None:
         (BASE_DIR / "ladder_state.json").write_text(json.dumps(state))
 
-    def _min_days(self, rung_index: int) -> float:
+    def _min_seconds(self, rung_index: int) -> float:
+        """Required tenure at the previous rung, in seconds. Prefers the
+        fine-grained LADDER_MIN_RANK_MINUTES (so early rungs can be minutes,
+        not days); falls back to the legacy days list."""
+        mins = self.config.get("LADDER_MIN_RANK_MINUTES")
+        if mins:
+            try:
+                return float(mins[rung_index]) * 60
+            except (IndexError, TypeError, ValueError):
+                return 0.0
         days = self.config.get("LADDER_MIN_RANK_DAYS", [])
         try:
-            return float(days[rung_index])
+            return float(days[rung_index]) * 86400
         except (IndexError, TypeError, ValueError):
             return 0.0
 
@@ -1229,7 +1353,7 @@ class Helper(discord.Client):
         uid = str(after.id)
         top = max(self.ladder.index(r) for r in gained)
         top_role_id = self.ladder[top]
-        required = self._min_days(top) * 86400
+        required = self._min_seconds(top)
 
         # tenure gate: how long has the member held the rung below?
         held_since = state["since"].get(uid, {}).get(str(self.ladder[top - 1])) if top else None
@@ -1248,14 +1372,14 @@ class Helper(discord.Client):
                 log.warning("Deferred-promotion removal failed for %s: %s", after, e)
             state["pending"][uid] = {"role": top_role_id, "eligible_at": eligible_at}
             self._ladder_state_save(state)
-            days_left = max(0.0, (eligible_at - _t.time()) / 86400)
+            left = max(0.0, eligible_at - _t.time())
             await self._try_dm(
                 after,
                 f"🎖️ You've earned the XP for **{role.name if role else 'your next rank'}** in "
                 f"**{after.guild.name}**! Ranks also take time — yours unlocks automatically in "
-                f"about **{days_left:.1f} day(s)**. Keep it up!",
+                f"about **{fmt_duration(left)}**. Keep it up!",
             )
-            log.info("Deferred promotion for %s: %s in %.1fd", after, top_role_id, days_left)
+            log.info("Deferred promotion for %s: %s in %s", after, top_role_id, fmt_duration(left))
             return
 
         # promotion proceeds: record tenure start, strip superseded rungs
