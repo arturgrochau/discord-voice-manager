@@ -138,10 +138,11 @@ def build_embeds(s: dict) -> list[dict]:
         "• Tickets survive bot restarts."
     )
     xp = (
-        "Nadeko (prefix `;`) awards **4 XP per message** (60 s cooldown) and "
-        "**12 XP/min in voice** — voice levels you ~3× faster by design. Rank "
+        "Nadeko (prefix `;`) awards **3 XP per message** (60 s cooldown) and "
+        "**6 XP/min in voice** — voice levels you ~2× faster by design. Rank "
         "roles are granted automatically and each promotion **replaces** the "
-        "previous rank role.\n\n"
+        "previous rank role. Level-ups are silent; the bot only announces a "
+        "**rank-up** when you earn a new ladder role.\n\n"
         "**Promotions also take time**: each rank has a minimum tenure at the "
         "previous rank (1 d for the second rung, scaling to 30 d at the top). "
         "Reach the XP early and the promotion is deferred — the member is DMed "
