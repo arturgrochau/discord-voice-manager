@@ -789,14 +789,14 @@ class RoomPanel(discord.ui.View):
         # third slot of the access row: Minors where configured, Random elsewhere
         if mgr.minor_role_id:
             btn = discord.ui.Button(label="Minors", emoji="🔞",
-                                    style=discord.ButtonStyle.secondary,
+                                    style=discord.ButtonStyle.danger,
                                     custom_id="vcr:minors", row=1)
             async def _cb(interaction: discord.Interaction):
                 if (vc := await self._guard(interaction)):
                     await self._reply(interaction, await self.mgr.act_nominors(vc, interaction.user), announce=True)
         else:
             btn = discord.ui.Button(label="Random", emoji="🎲",
-                                    style=discord.ButtonStyle.secondary,
+                                    style=discord.ButtonStyle.primary,
                                     custom_id="vcr:random", row=1)
             async def _cb(interaction: discord.Interaction):
                 if (vc := await self._guard(interaction)):
@@ -805,7 +805,7 @@ class RoomPanel(discord.ui.View):
         self.add_item(btn)
 
         kick = discord.ui.Button(label="Kick", emoji="👢",
-                                 style=discord.ButtonStyle.secondary,
+                                 style=discord.ButtonStyle.danger,
                                  custom_id="vcr:kick", row=2)
         async def _kick(interaction: discord.Interaction):
             if (vc := await self._guard(interaction)):
@@ -853,13 +853,13 @@ class RoomPanel(discord.ui.View):
             await interaction.response.send_modal(
                 _TextModal(self.mgr, vc, "size", "Room size", "Max members (0 = unlimited)", 2))
 
-    @discord.ui.button(label="Lock", emoji="🔒", style=discord.ButtonStyle.secondary,
+    @discord.ui.button(label="Lock", emoji="🔒", style=discord.ButtonStyle.danger,
                        custom_id="vcr:lock", row=1)
     async def b_lock(self, interaction, _):
         if (vc := await self._guard(interaction)):
             await self._reply(interaction, await self.mgr.act_lock(vc, interaction.user), announce=True)
 
-    @discord.ui.button(label="Voice", emoji="🎙️", style=discord.ButtonStyle.secondary,
+    @discord.ui.button(label="Voice", emoji="🎙️", style=discord.ButtonStyle.danger,
                        custom_id="vcr:voice", row=1)
     async def b_voice(self, interaction, _):
         if (vc := await self._guard(interaction)):
@@ -878,7 +878,7 @@ class RoomPanel(discord.ui.View):
                 "Ban who? (`..ban <name> 30` = 30-min ban, works for absent members too)",
                 view=view, ephemeral=True)
 
-    @discord.ui.button(label="Unban", emoji="♻️", style=discord.ButtonStyle.secondary,
+    @discord.ui.button(label="Unban", emoji="♻️", style=discord.ButtonStyle.primary,
                        custom_id="vcr:unban", row=2)
     async def b_unban(self, interaction, _):
         if (vc := await self._guard(interaction)):
@@ -888,13 +888,13 @@ class RoomPanel(discord.ui.View):
                     "Nobody is banned from this room. 🎉", ephemeral=True)
             await interaction.response.send_message("Unban who?", view=view, ephemeral=True)
 
-    @discord.ui.button(label="Bans", emoji="📋", style=discord.ButtonStyle.secondary,
+    @discord.ui.button(label="Bans", emoji="📋", style=discord.ButtonStyle.danger,
                        custom_id="vcr:bans", row=3)
     async def b_bans(self, interaction, _):
         if (vc := await self._guard(interaction)):
             await interaction.response.send_message(self.mgr.bans_text(vc), ephemeral=True)
 
-    @discord.ui.button(label="Mod", emoji="🛡️", style=discord.ButtonStyle.secondary,
+    @discord.ui.button(label="Mod", emoji="🛡️", style=discord.ButtonStyle.primary,
                        custom_id="vcr:mod", row=3)
     async def b_mod(self, interaction, _):
         if (vc := await self._guard(interaction)):
@@ -905,7 +905,7 @@ class RoomPanel(discord.ui.View):
             await interaction.response.send_message(
                 "Toggle room mod for… (✓ marks current mods)", view=view, ephemeral=True)
 
-    @discord.ui.button(label="Hush", emoji="🤫", style=discord.ButtonStyle.secondary,
+    @discord.ui.button(label="Hush", emoji="🤫", style=discord.ButtonStyle.danger,
                        custom_id="vcr:hush", row=3)
     async def b_hush(self, interaction, _):
         if (vc := await self._guard(interaction)):
@@ -916,13 +916,13 @@ class RoomPanel(discord.ui.View):
             await interaction.response.send_message(
                 "Toggle hush for… (✓ marks currently hushed)", view=view, ephemeral=True)
 
-    @discord.ui.button(label="Claim", emoji="👑", style=discord.ButtonStyle.success,
+    @discord.ui.button(label="Claim", emoji="👑", style=discord.ButtonStyle.primary,
                        custom_id="vcr:claim", row=4)
     async def b_claim(self, interaction, _):
         if (vc := await self._guard(interaction)):
             await self._reply(interaction, await self.mgr.act_claim(vc, interaction.user), announce=True)
 
-    @discord.ui.button(label="Transfer", emoji="➡️", style=discord.ButtonStyle.secondary,
+    @discord.ui.button(label="Transfer", emoji="➡️", style=discord.ButtonStyle.primary,
                        custom_id="vcr:transfer", row=4)
     async def b_transfer(self, interaction, _):
         if (vc := await self._guard(interaction)):
