@@ -519,6 +519,44 @@ class Moderation(commands.Cog):
                 + ". This runs in the background and can take a while; I'll report when done.",
                 delete_after=30)
 
+        # Channel-wide full purge: `all` with no user target. The most
+        # destructive op we have, so it is admin-tier and requires an explicit
+        # ✅ confirmation reaction before anything is deleted.
+        if deep and user_id is None:
+            import asyncio
+
+            if not is_admin:
+                return await ctx.reply("⛔ Purging an entire channel is admin-tier only.")
+            scope = (f" containing **{text}**" if text and not negate
+                     else f" **not** containing **{text}**" if text else "")
+            confirm = await ctx.reply(
+                f"⚠️ **Delete ALL messages{scope} in {ctx.channel.mention}?**\n"
+                f"This sweeps the whole channel history and **cannot be undone**. "
+                f"React ✅ within 30s to confirm (pinned messages are kept).")
+            try:
+                await confirm.add_reaction("✅")
+            except discord.HTTPException:
+                pass
+
+            def _confirm_check(reaction, user):
+                return (user.id == ctx.author.id
+                        and reaction.message.id == confirm.id
+                        and str(reaction.emoji) == "✅")
+
+            try:
+                await self.bot.wait_for("reaction_add", timeout=30.0, check=_confirm_check)
+            except asyncio.TimeoutError:
+                return await confirm.edit(
+                    content="🚫 Channel purge cancelled — no confirmation within 30s.")
+            await confirm.edit(content="🧹 Confirmed — purging the channel in the background…")
+            try:
+                await ctx.message.delete()
+            except discord.HTTPException:
+                pass
+            self.bot.loop.create_task(
+                self._deep_purge_user(ctx.channel, None, 100_000, ctx.author, text, negate))
+            return
+
         cap = self.prune_cap(ctx.author)
         if amount is None:
             amount = cap
@@ -534,7 +572,7 @@ class Moderation(commands.Cog):
                 f" not containing **{text}**" if text else "")
         await ctx.send(f"🧹 Deleted {n} message(s){what}.", delete_after=5)
 
-    async def _deep_purge_user(self, channel, user_id: int, limit: int, actor,
+    async def _deep_purge_user(self, channel, user_id: int | None, limit: int, actor,
                                text: str | None = None, negate: bool = False):
         """Delete up to `limit` of one user's messages across the whole channel
         history. Individual deletes with 429 backoff, so it bypasses the
@@ -546,7 +584,8 @@ class Moderation(commands.Cog):
         needle = (text or "").casefold()
 
         def match(m):
-            if m.author.id != user_id or m.pinned:
+            # user_id None = channel-wide purge (any author); pins are always kept
+            if m.pinned or (user_id is not None and m.author.id != user_id):
                 return False
             if needle:
                 has = needle in (m.content or "").casefold()
@@ -601,9 +640,10 @@ class Moderation(commands.Cog):
                             pass
         except Exception:
             log.exception("Deep purge error")
+        target = f"user `{user_id}`" if user_id is not None else "**ALL users**"
         await self.send_log(mod_embed(
             "🧹 Full-History Purge",
-            f"Removed **{deleted}** message(s) from user `{user_id}` in {channel.mention}, "
+            f"Removed **{deleted}** message(s) from {target} in {channel.mention}, "
             f"requested by {actor.mention}" + (f" (filter: {text!r})" if text else "") + ".",
             BLUE))
         try:
