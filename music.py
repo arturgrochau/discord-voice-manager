@@ -124,6 +124,7 @@ def _fmt_dur(seconds) -> str:
 
 
 DOWNLOAD_MAX_SECONDS = 15 * 60  # songs get fully downloaded; longer = stream
+MUSIC_MAX_CANDIDATES = 4        # try up to N search hits before giving up on a track
 
 
 class Track:
@@ -253,6 +254,32 @@ class MusicPlayer:
             return self._ydl().extract_info(query, download=False, process=flat)
         return await self.client.loop.run_in_executor(None, work)
 
+    def _search_candidates(self, query: str) -> list[str]:
+        """Flat-search YouTube and return several candidate video URLs (best
+        first), so a blocked/dead top hit falls back to the next real result.
+        Filters livestreams and non-song-length hits to stay on actual music."""
+        import yt_dlp
+        try:
+            with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "noprogress": True,
+                                   "extract_flat": True, "socket_timeout": 15}) as y:
+                res = y.extract_info(f"ytsearch{MUSIC_MAX_CANDIDATES}:{query}", download=False)
+        except Exception as e:
+            log.warning("Search failed for %r: %s", query[:60], e)
+            return [f"ytsearch1:{query}"]   # let the caller try a plain search
+        out = []
+        for e in (res.get("entries") or []):
+            if not e:
+                continue
+            if e.get("is_live") or e.get("live_status") == "is_live":
+                continue
+            dur = e.get("duration") or 0
+            if dur and dur > 3600:          # >1h = almost never the song (mix/stream)
+                continue
+            url = e.get("url") or e.get("webpage_url") or e.get("id")
+            if url:
+                out.append(url if str(url).startswith("http") else f"https://www.youtube.com/watch?v={url}")
+        return out or [f"ytsearch1:{query}"]
+
     async def _prepare_source(self, track: Track) -> tuple[str, bool] | None:
         """Get something ffmpeg can play. Returns (source, is_local).
 
@@ -276,20 +303,41 @@ class MusicPlayer:
             if want_dl:
                 self.cache_dir.mkdir(exist_ok=True)
                 opts["outtmpl"] = str(self.cache_dir / "%(id)s.%(ext)s")
+
+            # Build an ordered list of candidates to try. A single bad/blocked
+            # result should never skip the song — we fall back to the next
+            # search hit (and, for a dead direct URL, to a title search).
+            candidates: list[str] = []
             if track.url.startswith("ytsearch"):
-                opts["default_search"] = "ytsearch1"
-            with yt_dlp.YoutubeDL(opts) as y:
-                info = y.extract_info(track.url, download=want_dl)
-                if info.get("entries") is not None:  # search / playlist result
-                    entries = [e for e in info["entries"] if e]
-                    if not entries:
-                        return None, False
-                    info = entries[0]
+                query = track.url.split(":", 1)[1] if ":" in track.url else track.url
+                candidates = self._search_candidates(query)
+            else:
+                candidates = [track.url]
+                if track.title and track.title != track.url:
+                    candidates += self._search_candidates(track.title)
+
+            last_err = None
+            for cand in candidates[:MUSIC_MAX_CANDIDATES]:
+                try:
+                    with yt_dlp.YoutubeDL(opts) as y:
+                        info = y.extract_info(cand, download=want_dl)
+                    if info.get("entries") is not None:   # a search/playlist wrapper
+                        ents = [e for e in info["entries"] if e]
+                        if not ents:
+                            continue
+                        info = ents[0]
                     if not track.title or track.title == track.url:
                         track.title = info.get("title") or track.title
-                if want_dl:
-                    return y.prepare_filename(info), True
-                return info.get("url"), False
+                    if want_dl:
+                        return y.prepare_filename(info), True
+                    return info.get("url"), False
+                except Exception as e:
+                    last_err = e
+                    log.warning("Candidate failed (%s): %s", str(cand)[:60], e)
+                    continue
+            if last_err:
+                raise last_err
+            return None, False
 
         try:
             src, local = await self.client.loop.run_in_executor(None, work)
