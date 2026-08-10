@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import random
 import re
 import time
@@ -116,12 +117,31 @@ class RoomManager:
     def _load(path: Path) -> dict:
         try:
             return json.loads(path.read_text())
+        except FileNotFoundError:
+            return {}
         except Exception:
+            # corrupt (torn write): keep it aside for recovery, start clean
+            try:
+                path.replace(path.with_suffix(".corrupt"))
+            except OSError:
+                pass
             return {}
 
+    @staticmethod
+    def _atomic_write(path: Path, data) -> None:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        try:
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
     def _save(self) -> None:
-        self.prefs_path.write_text(json.dumps(self.prefs))
-        self.rooms_path.write_text(json.dumps(self.rooms))
+        self._atomic_write(self.prefs_path, self.prefs)
+        self._atomic_write(self.rooms_path, self.rooms)
 
     def room(self, channel_id: int) -> dict | None:
         return self.rooms.get(str(channel_id))
@@ -417,7 +437,20 @@ class RoomManager:
         ow.connect = False if turning_on else None
         ow.view_channel = False if turning_on else None
         await vc.set_permissions(role, overwrite=ow, reason="Minors toggle")
-        return "🔞 Minors can no longer join this room." if turning_on else "✅ Minors may join again."
+        if not turning_on:
+            return "✅ Minors may join again."
+        # A deny only blocks NEW joins — remove minors already inside (a
+        # member-level allow could also override the deny, so check the role).
+        removed = 0
+        for m in list(vc.members):
+            if m.get_role(self.minor_role_id):
+                try:
+                    await m.move_to(None, reason="Minors toggle: removed from room")
+                    removed += 1
+                except discord.HTTPException:
+                    pass
+        extra = f" Removed {removed} already inside." if removed else ""
+        return f"🔞 Minors can no longer join this room.{extra}"
 
     async def act_ban(self, vc, actor, member: discord.Member, minutes: int = 0) -> str:
         state = self.room(vc.id)
@@ -566,8 +599,19 @@ class RoomManager:
 
     async def _make_owner(self, vc, member, verb: str) -> str:
         state = self.room(vc.id)
+        prev = state.get("owner") or 0
         state["owner"] = member.id
         self._save()
+        # Revoke the PREVIOUS owner's overwrite before crowning the new one —
+        # otherwise a claimed/abandoned room's old owner keeps manage_channels
+        # (can delete the room), mute/deafen powers, and a connect=True that
+        # bypasses the new owner's lock. Also closes the double-claim race.
+        if prev and prev != member.id:
+            old = vc.guild.get_member(prev) or discord.Object(id=prev)
+            try:
+                await vc.set_permissions(old, overwrite=None, reason=f"Room {verb}: prior owner cleared")
+            except discord.HTTPException:
+                pass
         await vc.set_permissions(member, overwrite=_owner_overwrite(), reason=f"Room {verb}")
         await self._log(vc, f"{member.mention} {verb} the room.")
         return f"👑 {member.mention} has {verb} the room!"
@@ -636,7 +680,7 @@ class RoomManager:
                 out = await self.act_rename(vc, actor, arg)
             elif cmd == "status" and arg:
                 out = await self.act_status(vc, actor, arg)
-            elif cmd in ("setsize", "size", "limit") and arg.split()[0].isdigit():
+            elif cmd in ("setsize", "size", "limit") and arg.split() and arg.split()[0].isdigit():
                 out = await self.act_size(vc, actor, int(arg.split()[0]))
             elif cmd == "lock":
                 out = await self.act_lock(vc, actor)

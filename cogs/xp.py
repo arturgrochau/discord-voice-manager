@@ -108,15 +108,23 @@ class Xp(commands.Cog):
             return await ctx.reply("⚠️ XP database unavailable right now — try again shortly.")
         level = level_from_xp(xp)
 
+        # per-instance rates (P&P 2/3; HK sets 4/12 in its config) so estimates
+        # aren't wrong on the other server
+        msg_rate = float(self.bot.config.get("XP_PER_MESSAGE", 2) or 2)
+        voice_rate = float(self.bot.config.get("VOICE_XP_PER_MINUTE", 3) or 3)
+
         lines = [f"**Level {level}** · **{xp:,} XP** total"]
         held = [i for i, r in enumerate(roles) if ctx.guild.get_role(r) in member.roles]
         rank_i = max(held) if held else None
         if rank_i is not None:
-            lines.append(f"**Rank:** {ctx.guild.get_role(roles[rank_i]).mention}")
+            rr = ctx.guild.get_role(roles[rank_i])
+            if rr:
+                lines.append(f"**Rank:** {rr.mention}")
 
         next_i = (rank_i + 1) if rank_i is not None else 0
         if roles and next_i < len(roles) and next_i < len(levels):
             next_role = ctx.guild.get_role(roles[next_i])
+            nm = next_role.mention if next_role else "your next rank"
             need_level = levels[next_i]
             need_xp = total_xp_for_level(need_level)
             state = self._state()
@@ -125,21 +133,21 @@ class Xp(commands.Cog):
                 p_role = ctx.guild.get_role(int(pending["role"]))
                 left = max(0.0, pending.get("eligible_at", 0) - time.time())
                 lines.append(
-                    f"**Next:** {p_role.mention} — ✅ XP earned! Unlocks in "
+                    f"**Next:** {p_role.mention if p_role else nm} — ✅ XP earned! Unlocks in "
                     f"**{fmt_dur(left)}** (tenure gate)."
                 )
             elif xp >= need_xp:
-                lines.append(f"**Next:** {next_role.mention} — XP reached; promotion lands on your next activity.")
+                lines.append(f"**Next:** {nm} — XP reached; promotion lands on your next activity.")
             else:
                 to_go = need_xp - xp
                 frac = 0.0 if need_xp == 0 else xp / need_xp
-                est_voice = to_go / (3 * 60)    # 3 XP/min in voice
-                est_msgs = math.ceil(to_go / 2)  # 2 XP/message
+                est_voice = to_go / (voice_rate * 60)
+                est_msgs = math.ceil(to_go / msg_rate)
                 lines.append(
-                    f"**Next:** {next_role.mention} at level {need_level} "
+                    f"**Next:** {nm} at level {need_level} "
                     f"({need_xp:,} XP)\n{bar(frac)} `{xp:,}/{need_xp:,}`\n"
                     f"**{to_go:,} XP to go** ≈ {est_voice:.1f}h in voice 🎙️ "
-                    f"or ~{est_msgs:,} messages 💬 (voice levels ~2× faster)"
+                    f"or ~{est_msgs:,} messages 💬 (voice levels faster)"
                 )
                 if next_i < len(min_secs) and min_secs[next_i] > 0:
                     since = state.get("since", {}).get(str(member.id), {}).get(str(roles[rank_i])) if rank_i is not None else None
@@ -147,7 +155,7 @@ class Xp(commands.Cog):
                         served = time.time() - since
                         lines.append(f"**Tenure:** {fmt_dur(served)} / {fmt_dur(min_secs[next_i])} at current rank")
                     else:
-                        lines.append(f"**Tenure:** {fmt_dur(min_secs[next_i])} at current rank also required")
+                        lines.append(f"**Tenure:** {fmt_dur(min_secs[next_i])} at current rank (your clock starts at your next promotion)")
         elif roles and rank_i == len(roles) - 1:
             lines.append("🏆 **Top of the ladder — nothing left to climb.**")
 

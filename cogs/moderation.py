@@ -69,6 +69,7 @@ class Moderation(commands.Cog):
         self._suppress_role_log: set[int] = set()
         self._ping_stop = False       # set by `.ping stop` to abort a run
         self._ping_running = False     # only one chain-ping at a time
+        self._purge_channels: set[int] = set()   # channels with a deep purge running
 
     # -- helpers -----------------------------------------------------------
 
@@ -148,7 +149,13 @@ class Moderation(commands.Cog):
         strip = [r for r in member.roles
                  if r != ctx.guild.default_role and not r.managed
                  and r < ctx.guild.me.top_role and r != role]
-        await member.add_roles(role, reason=f"Detained by {ctx.author}: {reason or 'no reason'}")
+        try:
+            await member.add_roles(role, reason=f"Detained by {ctx.author}: {reason or 'no reason'}")
+        except discord.HTTPException as e:
+            # don't leave a stale suppress entry that would swallow the next
+            # manual detain's audit log / DB record (anti-bypass would break)
+            self._suppress_role_log.discard(member.id)
+            return await ctx.reply(f"⚠️ Detain failed: {e}")
         if strip:
             try:
                 await member.remove_roles(*strip, reason="Detained — roles held for restoration")
@@ -423,13 +430,19 @@ class Moderation(commands.Cog):
     # -- channel tools -----------------------------------------------------
 
     async def _do_purge(self, ctx_or_itx, channel, author, amount: int, member,
-                        text: str | None = None, negate: bool = False):
+                        text: str | None = None, negate: bool = False,
+                        target_id: int | None = None):
         needle = (text or "").casefold()
+        # Filter by ID, not the Member object: a bare `.p <id> N` for someone
+        # who already LEFT has member=None, and filtering on that would match
+        # (and delete) EVERYONE's messages. Fall back to member.id when present.
+        if target_id is None and member is not None:
+            target_id = member.id
 
         def check(m):
             if m.pinned:
                 return False  # pins are curated; never bulk-delete them
-            if member and m.author.id != member.id:
+            if target_id is not None and m.author.id != target_id:
                 return False
             if needle:
                 has = needle in (m.content or "").casefold()
@@ -505,6 +518,12 @@ class Moderation(commands.Cog):
         if user_id is not None and (deep or (amount is not None and amount > self.prune_cap(ctx.author))):
             if not is_admin:
                 return await ctx.reply("⛔ Full-history user purge is admin-tier only.")
+            perms = ctx.channel.permissions_for(ctx.guild.me)
+            if not (perms.manage_messages and perms.read_message_history):
+                return await ctx.reply("⛔ I need Manage Messages + Read Message History here.")
+            if ctx.channel.id in self._purge_channels:
+                return await ctx.reply("⛔ A deep purge is already running in this channel.")
+            self._purge_channels.add(ctx.channel.id)
             limit = 100_000 if deep else amount
             try:
                 await ctx.message.delete()
@@ -527,12 +546,18 @@ class Moderation(commands.Cog):
 
             if not is_admin:
                 return await ctx.reply("⛔ Purging an entire channel is admin-tier only.")
+            perms = ctx.channel.permissions_for(ctx.guild.me)
+            if not (perms.manage_messages and perms.read_message_history):
+                return await ctx.reply("⛔ I need Manage Messages + Read Message History here.")
             scope = (f" containing **{text}**" if text and not negate
                      else f" **not** containing **{text}**" if text else "")
+            # delete_after=45 opts OUT of TidyContext's 15s auto-delete, so the
+            # confirm (and its ✅) outlives the 30s reaction window.
             confirm = await ctx.reply(
                 f"⚠️ **Delete ALL messages{scope} in {ctx.channel.mention}?**\n"
                 f"This sweeps the whole channel history and **cannot be undone**. "
-                f"React ✅ within 30s to confirm (pinned messages are kept).")
+                f"React ✅ within 30s to confirm (pinned messages are kept).",
+                delete_after=45)
             try:
                 await confirm.add_reaction("✅")
             except discord.HTTPException:
@@ -546,9 +571,19 @@ class Moderation(commands.Cog):
             try:
                 await self.bot.wait_for("reaction_add", timeout=30.0, check=_confirm_check)
             except asyncio.TimeoutError:
-                return await confirm.edit(
-                    content="🚫 Channel purge cancelled — no confirmation within 30s.")
-            await confirm.edit(content="🧹 Confirmed — purging the channel in the background…")
+                try:
+                    await confirm.edit(content="🚫 Channel purge cancelled — no confirmation within 30s.")
+                except discord.HTTPException:
+                    await ctx.send("🚫 Channel purge cancelled — no confirmation within 30s.", delete_after=15)
+                return
+            # concurrency guard: check+add is synchronous, so it's atomic here
+            if ctx.channel.id in self._purge_channels:
+                return await ctx.send("⛔ A deep purge is already running in this channel.", delete_after=15)
+            self._purge_channels.add(ctx.channel.id)
+            try:
+                await confirm.edit(content="🧹 Confirmed — purging the channel in the background…")
+            except discord.HTTPException:
+                pass
             try:
                 await ctx.message.delete()
             except discord.HTTPException:
@@ -567,7 +602,8 @@ class Moderation(commands.Cog):
             await ctx.message.delete()
         except discord.HTTPException:
             pass
-        n = await self._do_purge(ctx, ctx.channel, ctx.author, amount, member, text, negate)
+        target_id = user_id if user_id is not None else (member.id if member else None)
+        n = await self._do_purge(ctx, ctx.channel, ctx.author, amount, member, text, negate, target_id)
         what = (f" containing **{text}**" if text and not negate else
                 f" not containing **{text}**" if text else "")
         await ctx.send(f"🧹 Deleted {n} message(s){what}.", delete_after=5)
@@ -593,54 +629,79 @@ class Moderation(commands.Cog):
             return True
 
         deleted = 0
+        fails = 0                     # consecutive non-429 delete failures
+        MAX_FAILS = 25               # abort a 403/404 storm before Discord IP-bans us
+        aborted = False
         cutoff = datetime.now(timezone.utc) - timedelta(days=13, hours=12)
         recent_batch: list = []
+
+        async def _del_single(m) -> bool:
+            """Delete one old message with 429 backoff. Returns True on success.
+            Non-429 failures sleep (to avoid an invalid-request storm) and count."""
+            nonlocal fails
+            for _ in range(6):
+                try:
+                    await m.delete()
+                    fails = 0
+                    await asyncio.sleep(1.0)
+                    return True
+                except discord.HTTPException as e:
+                    if getattr(e, "status", None) == 429:
+                        await asyncio.sleep(float(getattr(e, "retry_after", 3)) + 0.5)
+                    else:
+                        fails += 1
+                        await asyncio.sleep(1.0)
+                        return False
+            return False
+
         try:
             async for msg in channel.history(limit=None, oldest_first=False):
-                if deleted >= limit:
+                if deleted >= limit or fails >= MAX_FAILS:
+                    if fails >= MAX_FAILS:
+                        aborted = True
                     break
                 if not match(msg):
                     continue
                 if msg.created_at > cutoff:
                     recent_batch.append(msg)
-                    if len(recent_batch) >= 100:
+                    room = limit - deleted
+                    if len(recent_batch) >= min(100, max(1, room)):
+                        chunk = recent_batch[:room]
                         try:
-                            await channel.delete_messages(recent_batch)
-                            deleted += len(recent_batch)
+                            await channel.delete_messages(chunk)
+                            deleted += len(chunk)
+                            fails = 0
                         except discord.HTTPException:
-                            for m in recent_batch:  # fall back to singles
-                                try:
-                                    await m.delete(); deleted += 1
-                                    await asyncio.sleep(1.0)
-                                except discord.HTTPException:
-                                    pass
+                            for m in chunk:  # fall back to singles
+                                if deleted >= limit or fails >= MAX_FAILS:
+                                    break
+                                if await _del_single(m):
+                                    deleted += 1
                         recent_batch.clear()
                         await asyncio.sleep(1.0)
                 else:
-                    for attempt in range(6):
-                        try:
-                            await msg.delete(); deleted += 1
-                            await asyncio.sleep(1.0)  # old-message delete bucket
-                            break
-                        except discord.HTTPException as e:
-                            if getattr(e, "status", None) == 429:
-                                await asyncio.sleep(float(getattr(e, "retry_after", 3)) + 0.5)
-                            else:
-                                break
-            if recent_batch:
+                    if await _del_single(msg):
+                        deleted += 1
+            if recent_batch and deleted < limit and fails < MAX_FAILS:
+                chunk = recent_batch[:limit - deleted]
                 try:
-                    await channel.delete_messages(recent_batch)
-                    deleted += len(recent_batch)
+                    await channel.delete_messages(chunk)
+                    deleted += len(chunk)
                 except discord.HTTPException:
-                    for m in recent_batch:
-                        try:
-                            await m.delete(); deleted += 1
-                            await asyncio.sleep(1.0)
-                        except discord.HTTPException:
-                            pass
+                    for m in chunk:
+                        if deleted >= limit or fails >= MAX_FAILS:
+                            break
+                        if await _del_single(m):
+                            deleted += 1
+            if fails >= MAX_FAILS:
+                aborted = True
         except Exception:
             log.exception("Deep purge error")
+        finally:
+            self._purge_channels.discard(channel.id)   # never leak the guard
         target = f"user `{user_id}`" if user_id is not None else "**ALL users**"
+        if aborted:
+            target += f" (ABORTED after {MAX_FAILS} consecutive delete failures — check my perms)"
         await self.send_log(mod_embed(
             "🧹 Full-History Purge",
             f"Removed **{deleted}** message(s) from {target} in {channel.mention}, "
@@ -732,17 +793,24 @@ class Moderation(commands.Cog):
                 await self.bot.wait_for(
                     "reaction_add", timeout=60,
                     check=lambda r, u: u.id == ctx.author.id and str(r.emoji) == "✅" and r.message.id == warn.id)
-            except Exception:
-                return await warn.edit(content="Cancelled — no confirmation.")
+            except asyncio.TimeoutError:
+                try:
+                    return await warn.edit(content="Cancelled — no confirmation.")
+                except discord.HTTPException:
+                    return await ctx.send("Cancelled — no confirmation.", delete_after=15)
 
+        # Claim the flag synchronously (no await between check and set) so a
+        # second .ping during the confirmation window can't double-run.
+        if self._ping_running:
+            return await ctx.reply("A chain ping is already running — `.ping stop` first.")
+        self._ping_running = True
+        self._ping_stop = False
         self.bot.loop.create_task(self._run_ping(ctx.channel, targets, ctx.author))
         await ctx.reply(f"📣 Chain-pinging **{len(targets)}** member(s) one by one. `.ping stop` to abort.")
 
     async def _run_ping(self, channel, targets, actor):
         import asyncio
 
-        self._ping_running = True
-        self._ping_stop = False
         done = 0
         try:
             for mem in targets:

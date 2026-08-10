@@ -137,7 +137,9 @@ class Helper(discord.Client):
         self.temp_vcs: dict[int, float] = {}  # channel id -> created-at monotonic
         self.bump_channel_id = int(config.get("BUMP_CHANNEL_ID", 0) or 0)
         self.general_channel_id = int(config.get("GENERAL_CHANNEL_ID", 0) or 0)
-        self._last_reward_at = 0.0
+        # -BUMP_COOLDOWN so the first bump after a reboot isn't suppressed for
+        # ~2h by the monotonic-vs-0 guard (monotonic clock resets to ~0 on boot).
+        self._last_reward_at = -BUMP_COOLDOWN
         self._reminder_msgs: list = []  # live reminder messages to clear on bump
         # bump state persisted to disk so reminders survive restarts: a poll
         # loop (not a fragile in-memory timer) owns the reminder lifecycle
@@ -454,8 +456,9 @@ class Helper(discord.Client):
         except discord.HTTPException:
             pass
 
-    def _read_xp(self, user_id: int) -> int:
-        """Read a member's Nadeko server XP (read-only, never writes)."""
+    def _read_xp(self, user_id: int):
+        """Read a member's Nadeko server XP (read-only). Returns None on DB
+        failure (so the card can say so) vs 0 for a genuine no-row new member."""
         import sqlite3
 
         try:
@@ -466,7 +469,7 @@ class Helper(discord.Client):
                 ).fetchone()
             return int(row[0]) if row else 0
         except Exception:
-            return 0
+            return None
 
     async def _show_level(self, message) -> None:
         """`..level` — a self-service rank card: level, XP bar to the next
@@ -476,6 +479,14 @@ class Helper(discord.Client):
         member = message.author
         guild = message.guild
         xp = self._read_xp(member.id)
+        if xp is None:
+            try:
+                await message.channel.send(
+                    "XP database unavailable right now — try again shortly.", delete_after=30)
+                await message.delete(delay=2)
+            except discord.HTTPException:
+                pass
+            return
         level = level_from_xp(xp)
         roles = self.ladder
         levels = [int(x) for x in self.config.get("LADDER_LEVELS", [])]
@@ -508,14 +519,16 @@ class Helper(discord.Client):
                 frac = 0.0 if need_xp == 0 else xp / need_xp
                 filled = round(max(0.0, min(1.0, frac)) * 12)
                 bar = "▰" * filled + "▱" * (12 - filled)
-                est_voice = to_go / (3 * 60)     # 3 XP/min in voice
                 import math as _m
-                est_msgs = _m.ceil(to_go / 2)    # 2 XP/message
+                msg_rate = float(self.config.get("XP_PER_MESSAGE", 2) or 2)
+                voice_rate = float(self.config.get("VOICE_XP_PER_MINUTE", 3) or 3)
+                est_voice = to_go / (voice_rate * 60)
+                est_msgs = _m.ceil(to_go / msg_rate)
                 lines.append(
                     f"**Next:** {nm} at level {need_level} ({need_xp:,} XP)\n"
                     f"{bar} `{xp:,}/{need_xp:,}`\n"
                     f"**{to_go:,} XP to go** ≈ {est_voice:.1f}h in voice 🎙️ "
-                    f"or ~{est_msgs:,} messages 💬 (voice ~2× faster)")
+                    f"or ~{est_msgs:,} messages 💬 (voice levels faster)")
                 req = self._min_seconds(next_i)
                 if req > 0:
                     since = (state.get("since", {}).get(str(member.id), {})
@@ -525,7 +538,7 @@ class Helper(discord.Client):
                         lines.append(f"**Tenure:** {fmt_duration(served)} / "
                                      f"{fmt_duration(req)} at current rank")
                     else:
-                        lines.append(f"**Tenure:** {fmt_duration(req)} at current rank also required")
+                        lines.append(f"**Tenure:** {fmt_duration(req)} at current rank (your clock starts at your next promotion)")
         elif roles and rank_i == len(roles) - 1:
             lines.append("🏆 **Top of the ladder — nothing left to climb.**")
 
@@ -587,7 +600,8 @@ class Helper(discord.Client):
             return
         # ..level / ..rank card (two-dot = member self-service). Single-dot
         # `.level` stays owned by the sentinel, so we only claim the `..` forms.
-        if content.lower() in ("..level", "..lvl", "..rank", "..next") and not message.author.bot:
+        # NOT "..next" — that is music's skip alias; use ..level/..lvl/..rank.
+        if content.lower() in ("..level", "..lvl", "..rank") and not message.author.bot:
             await self._show_level(message)
             return
         if content.startswith("..") and author_ok:
@@ -927,13 +941,15 @@ class Helper(discord.Client):
         if contest_cfg.get("ACTIVE") and end_raw:
             try:
                 end = datetime.fromisoformat(end_raw)
+                if end.tzinfo is None:            # naive END -> assume UTC, avoid TypeError
+                    end = end.replace(tzinfo=timezone.utc)
                 if end > datetime.now(timezone.utc):
                     ch = int(contest_cfg.get("CHANNEL_ID", 0) or 0)
                     items.append((
                         "giveaway",
                         f"🎁 **5x Discord Nitro** giveaway ends <t:{int(end.timestamp())}:R>. "
                         f"See where you stand in <#{ch}>."))
-            except ValueError:
+            except (ValueError, TypeError):
                 pass
         book_ch = int(self.config.get("BOOK_CLUB_CHANNEL_ID", 0) or 0)
         if book_ch:
@@ -957,7 +973,9 @@ class Helper(discord.Client):
 
         from datetime import datetime, timezone
 
-        state_path = Path(__file__).resolve().parent / "spotlight_state.json"
+        # BASE_DIR (HELPER_HOME), not the shared repo dir — else P&P and HK
+        # instances clobber each other's rotation index.
+        state_path = BASE_DIR / "spotlight_state.json"
         try:
             state = json.loads(state_path.read_text())
         except Exception:
@@ -971,12 +989,12 @@ class Helper(discord.Client):
                 first_delay = max(120, SPOTLIGHT_INTERVAL - age)
         await asyncio.sleep(first_delay)
         while True:
-            channel = self.get_channel(self.general_channel_id)
-            items = self._spotlight_items()
-            if channel is None or not items:
-                await asyncio.sleep(SPOTLIGHT_INTERVAL)
-                continue
             try:
+                channel = self.get_channel(self.general_channel_id)
+                items = self._spotlight_items()
+                if channel is None or not items:
+                    await asyncio.sleep(SPOTLIGHT_INTERVAL)
+                    continue
                 # hold the round unless a human has spoken since the standing
                 # spotlight went up — a nudge into a dead room helps nobody
                 human_since, standing = False, None
@@ -996,10 +1014,13 @@ class Helper(discord.Client):
                 embed.set_footer(text="server spotlight")
                 await self._prune_bot_posts(channel, self._is_spotlight_post)
                 await channel.send(embed=embed)
-                state_path.write_text(json.dumps(state))
+                try:
+                    state_path.write_text(json.dumps(state))
+                except OSError as e:
+                    log.warning("Spotlight state save failed: %s", e)
                 log.info("Posted spotlight: %s", key)
-            except discord.HTTPException as e:
-                log.warning("Spotlight post failed: %s", e)
+            except Exception:
+                log.exception("Spotlight loop error")   # never let one tick kill the loop
             await asyncio.sleep(SPOTLIGHT_INTERVAL)
 
     # -- book club recommendations -----------------------------------------
@@ -1283,6 +1304,9 @@ class Helper(discord.Client):
         if role is None or role in member.roles \
                 or any(r.id in self.ladder for r in member.roles):
             return
+        # don't tag a detained member with a base rank mid-punishment
+        if self.detain_role_id and member.get_role(self.detain_role_id):
+            return
         try:
             await member.add_roles(role, reason="Base rank: everyone starts as Novice")
             log.info("Autorole: %s -> %s", role.name, member)
@@ -1315,7 +1339,17 @@ class Helper(discord.Client):
             return {"since": {}, "pending": {}}
 
     def _ladder_state_save(self, state: dict) -> None:
-        (BASE_DIR / "ladder_state.json").write_text(json.dumps(state))
+        # atomic: a torn write here silently loses everyone's tenure/pending state
+        path = BASE_DIR / "ladder_state.json"
+        tmp = path.with_suffix(".json.tmp")
+        try:
+            with open(tmp, "w") as f:
+                json.dump(state, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except OSError as e:
+            log.error("ladder_state save failed: %s", e)
 
     def _min_seconds(self, rung_index: int) -> float:
         """Required tenure at the previous rung, in seconds. Prefers the
@@ -1349,29 +1383,59 @@ class Helper(discord.Client):
             return
         import time as _t
 
+        # Never promote/gate a detained member — the sentinel strips their roles;
+        # re-adding a rank here would undo the punishment. Leave it to release.
+        if self.detain_role_id and after.get_role(self.detain_role_id):
+            return
+
         state = self._ladder_state_load()
         uid = str(after.id)
         top = max(self.ladder.index(r) for r in gained)
         top_role_id = self.ladder[top]
         required = self._min_seconds(top)
 
-        # tenure gate: how long has the member held the rung below?
-        held_since = state["since"].get(uid, {}).get(str(self.ladder[top - 1])) if top else None
         pending = state["pending"].get(uid)
+        pending_rung = None
+        if pending:
+            try:
+                pending_rung = self.ladder.index(int(pending["role"]))
+            except (ValueError, KeyError, TypeError):
+                pending_rung = None
+
+        already = state["since"].get(uid, {})
+        # Re-gaining a rung we already legitimately reached, or a rung BELOW a
+        # pending higher one (role-persist restore on rejoin, undetain, manual
+        # re-add): accept it — do NOT gate or strip. Just backfill its clock.
+        if str(top_role_id) in already or (pending_rung is not None and top < pending_rung):
+            state["since"].setdefault(uid, {}).setdefault(str(top_role_id), _t.time())
+            self._ladder_state_save(state)
+            return
+
+        # tenure gate: how long has the member held the rung below?
+        held_since = already.get(str(self.ladder[top - 1])) if top else None
         gate = required > 0 and (
             pending is not None  # already waiting on a promotion: keep waiting
             or (held_since is not None and _t.time() - held_since < required)
         )
         if gate:
-            eligible_at = (pending or {}).get("eligible_at") or (held_since + required)
+            if pending and pending_rung is not None and pending_rung != top:
+                # gaining a DIFFERENT rung while one is pending: serve this
+                # rung's tenure ON TOP of the pending one, don't inherit its clock
+                eligible_at = (pending.get("eligible_at") or _t.time()) + required
+            else:
+                eligible_at = (pending or {}).get("eligible_at") or ((held_since or _t.time()) + required)
+            # Persist the pending entry BEFORE the awaited remove_roles: load
+            # (above) through save is otherwise synchronous, so writing first
+            # makes the read-modify-write atomic on the event loop and a
+            # concurrent member-update can't clobber this member's pending entry.
+            state["pending"][uid] = {"role": top_role_id, "eligible_at": eligible_at}
+            self._ladder_state_save(state)
             role = after.guild.get_role(top_role_id)
             try:
                 if role and role in after.roles:
                     await after.remove_roles(role, reason="Ladder: tenure not yet served — promotion deferred")
             except discord.HTTPException as e:
                 log.warning("Deferred-promotion removal failed for %s: %s", after, e)
-            state["pending"][uid] = {"role": top_role_id, "eligible_at": eligible_at}
-            self._ladder_state_save(state)
             left = max(0.0, eligible_at - _t.time())
             await self._try_dm(
                 after,
@@ -1415,6 +1479,10 @@ class Helper(discord.Client):
         for member in guild.members:
             if member.bot or member.pending:
                 continue
+            # leave detained members entirely to the sentinel — don't grant
+            # Novice or reshuffle ranks on someone who's being punished
+            if self.detain_role_id and member.get_role(self.detain_role_id):
+                continue
             held = [r for r in member.roles if r.id in rung_set]
             try:
                 if held:
@@ -1443,31 +1511,41 @@ class Helper(discord.Client):
 
         while True:
             await asyncio.sleep(1800)
-            state = self._ladder_state_load()
-            due = {uid: p for uid, p in state["pending"].items()
-                   if p.get("eligible_at", 0) <= _t.time()}
-            if not due:
-                continue
-            guild = self.get_guild(self.guild_id)
-            if guild is None:
-                continue
-            for uid, p in due.items():
-                member = guild.get_member(int(uid))
-                role = guild.get_role(int(p["role"]))
-                state["pending"].pop(uid, None)
-                if member is None or role is None:
-                    self._ladder_state_save(state)
+            try:
+                state = self._ladder_state_load()
+                due = {uid: p for uid, p in state.get("pending", {}).items()
+                       if p.get("eligible_at", 0) <= _t.time()}
+                if not due:
                     continue
-                state["since"].setdefault(uid, {})[str(role.id)] = _t.time()
-                # save BEFORE the role add: the resulting member-update event
-                # must not see a stale pending entry and re-defer the promotion
-                self._ladder_state_save(state)
-                try:
-                    await member.add_roles(role, reason="Ladder: tenure served — deferred promotion applied")
-                    await self._try_dm(member, f"🎖️ Tenure served — you are now **{role.name}** in **{guild.name}**!")
-                    log.info("Applied deferred promotion: %s -> %s", member, role.name)
-                except discord.HTTPException as e:
-                    log.warning("Deferred promotion failed for %s: %s", member, e)
+                guild = self.get_guild(self.guild_id)
+                if guild is None:
+                    continue
+                for uid, p in due.items():
+                    member = guild.get_member(int(uid))
+                    role = guild.get_role(int(p["role"]))
+                    # A detained member keeps their pending entry (do NOT pop) so
+                    # the promotion lands after release instead of being lost.
+                    if member is not None and self.detain_role_id \
+                            and member.get_role(self.detain_role_id):
+                        continue
+                    # Re-load + mutate + save per uid so we never hold a stale
+                    # snapshot across the add_roles await (which clobbers other
+                    # handlers' saves that land during it).
+                    state = self._ladder_state_load()
+                    state.get("pending", {}).pop(uid, None)
+                    if member is None or role is None:
+                        self._ladder_state_save(state)
+                        continue
+                    state.setdefault("since", {}).setdefault(uid, {})[str(role.id)] = _t.time()
+                    self._ladder_state_save(state)
+                    try:
+                        await member.add_roles(role, reason="Ladder: tenure served — deferred promotion applied")
+                        await self._try_dm(member, f"🎖️ Tenure served — you are now **{role.name}** in **{guild.name}**!")
+                        log.info("Applied deferred promotion: %s -> %s", member, role.name)
+                    except (discord.HTTPException, OSError) as e:
+                        log.warning("Deferred promotion failed for %s: %s", member, e)
+            except Exception:
+                log.exception("pending promotions tick failed")   # never kill the loop
 
     # -- reaction roles ----------------------------------------------------
 
@@ -1602,9 +1680,10 @@ class Helper(discord.Client):
 
                 # alone tracking: sole human in a channel, any mute state
                 still_alone: set[int] = set()
+                music_ch = getattr(getattr(self, "music", None), "channel_id", 0)
                 for vc in guild.voice_channels:
-                    if vc.id in (self.afk_channel_id, self.trigger_id):
-                        continue
+                    if vc.id in (self.afk_channel_id, self.trigger_id, music_ch):
+                        continue  # skip the music player's channel (0 when idle)
                     humans = [m for m in vc.members if not m.bot]
                     if len(humans) == 1:
                         still_alone.add(humans[0].id)

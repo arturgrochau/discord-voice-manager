@@ -209,8 +209,11 @@ class MusicPlayer:
         try:
             self.voice = await ch.connect(self_deaf=True)
         except Exception as e:
-            log.warning("Music restore: reconnect failed: %s", e)
-            self._clear_state()
+            # Keep the saved queue/state intact — the idle-loop watchdog retries
+            # the reconnect every 30s. Wiping it here loses the whole queue on a
+            # single transient failure (the M1's periodic DNS blips).
+            log.warning("Music restore: reconnect failed (will retry): %s", e)
+            self._last_channel_id = ch.id
             return
         self._last_channel_id = ch.id
         await self._maximize_channel(ch)
@@ -469,9 +472,12 @@ class MusicPlayer:
                 prepared = await self._prepare_source(track)
                 if prepared is None:
                     if self.text_channel:
-                        await self.text_channel.send(
-                            embed=self._embed(f"Skipping **{track.title}**, couldn't load it."),
-                            delete_after=60)
+                        try:  # a failed announce must not abort the whole queue
+                            await self.text_channel.send(
+                                embed=self._embed(f"Skipping **{track.title}**, couldn't load it."),
+                                delete_after=60)
+                        except discord.HTTPException:
+                            pass
                     continue
                 source, is_local = prepared
                 src = discord.PCMVolumeTransformer(
@@ -494,7 +500,12 @@ class MusicPlayer:
                     _self.current = None
                     _self._idle_since = time.monotonic()
                     fut = asyncio.run_coroutine_threadsafe(_self._advance(), _self.client.loop)
-                    fut.add_done_callback(lambda f: f.exception())
+
+                    def _log_advance(f):
+                        exc = f.exception()
+                        if exc:
+                            log.error("Music _advance failed: %r", exc)
+                    fut.add_done_callback(_log_advance)
 
                 try:
                     self.voice.play(src, after=after, **self._encoder_opts())
